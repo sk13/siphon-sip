@@ -11,6 +11,7 @@ mod late_response_tests;
 pub mod mtu;
 pub mod mux;
 pub mod outbound_tls;
+pub mod peer_identity;
 pub mod pool;
 mod pool_writer;
 pub mod proxy_protocol;

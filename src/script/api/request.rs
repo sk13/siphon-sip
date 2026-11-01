@@ -1020,6 +1020,23 @@ impl PyRequest {
             .is_some_and(crate::transport::Transport::is_secure)
     }
 
+    /// Common Name of the client certificate the peer presented on the TLS connection this request arrived on, or
+    /// ``None`` (not TLS, or no client certificate). The certificate chained to ``tls.client_ca``: the name is the
+    /// identity of the peer, as Kamailio's ``$tls_peer_subject_cn``.
+    #[getter]
+    fn tls_peer_cn(&self) -> Option<String> {
+        crate::transport::peer_identity::lookup(self.inbound_connection_id?)?.common_name
+    }
+
+    /// DNS subjectAltNames of that client certificate (empty when there is none).
+    #[getter]
+    fn tls_peer_dns(&self) -> Vec<String> {
+        self.inbound_connection_id
+            .and_then(crate::transport::peer_identity::lookup)
+            .map(|peer| peer.dns)
+            .unwrap_or_default()
+    }
+
     /// Source IP address.
     #[getter]
     fn source_ip(&self) -> String {

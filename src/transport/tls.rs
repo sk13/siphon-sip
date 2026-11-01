@@ -894,6 +894,14 @@ pub async fn listen(
 
                         let connection_id = next_connection_id();
                         debug!("TLS accepted {} as {:?}", remote_addr, connection_id);
+                        // The client certificate the handshake verified, for `request.tls_peer_cn`.
+                        let peer = crate::transport::peer_identity::from_certificates(
+                            tls_stream.get_ref().1.peer_certificates(),
+                        );
+                        let has_peer = peer.is_some();
+                        if let Some(peer) = peer {
+                            crate::transport::peer_identity::remember(connection_id.0, peer);
+                        }
 
                         let (reader, writer) = tokio::io::split(tls_stream);
                         serve_sip_stream(
@@ -914,6 +922,9 @@ pub async fn listen(
                             close_tx,
                         )
                         .await;
+                        if has_peer {
+                            crate::transport::peer_identity::forget(connection_id.0);
+                        }
                     });
                 }
                 Err(error) => {
