@@ -148,6 +148,7 @@ fn a_listener_can_turn_verification_off_and_drops_the_inherited_subject() {
         verify_client: true,
         client_ca: Some("ca".to_string()),
         client_subject: vec!["*.sip.example.net".to_string()],
+        client_crl: None,
         client_certificate: None,
         client_private_key: None,
         verify_server: false,
