@@ -230,9 +230,24 @@ fn split_comma_respecting_angles(input: &str) -> Vec<&str> {
     let mut parts = Vec::new();
     let mut depth = 0u32;
     let mut start = 0;
+    // A comma inside a quoted string (a quoted parameter value such as the `+g.3gpp.icsi-ref="a,b"` feature tag of
+    // RFC 3840, or a display name) separates nothing.
+    let mut in_quote = false;
+    let mut escaped = false;
 
     for (i, c) in input.char_indices() {
+        if in_quote {
+            if escaped {
+                escaped = false;
+            } else if c == '\\' {
+                escaped = true;
+            } else if c == '"' {
+                in_quote = false;
+            }
+            continue;
+        }
         match c {
+            '"' => in_quote = true,
             '<' => depth += 1,
             '>' => depth = depth.saturating_sub(1),
             ',' if depth == 0 => {
