@@ -1014,6 +1014,13 @@ impl PyProxyUtils {
         })
     }
 
+    /// Read the client certificate revocation list (``tls.client_crl``) again, on every TLS listener that checks one.
+    /// Returns the number of listeners that now hold the fresh list; raises when a list cannot be read (that listener
+    /// keeps the one in force). For the operator RPC `tls.reload`: the file watcher of the list needs inotify.
+    fn reload_client_crl(&self) -> PyResult<usize> {
+        crate::transport::tls_client_auth::reload_client_crls().map_err(pyo3::exceptions::PyRuntimeError::new_err)
+    }
+
     /// Return approximate RSS memory usage as a percentage (0-100).
     ///
     /// Reads `/proc/self/status` on Linux. Returns 0 on non-Linux platforms.

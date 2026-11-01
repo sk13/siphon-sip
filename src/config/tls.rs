@@ -48,6 +48,13 @@ pub struct TlsServerConfig {
     /// default) checks the chain only. Requires `verify_client: true`.
     #[serde(default)]
     pub client_subject: Vec<String>,
+    /// Certificate revocation list (PEM, or one DER CRL) the client certificates of `verify_client` are checked against:
+    /// a certificate its issuer's CRL lists is refused at the handshake. Only the client's own certificate is checked, and
+    /// a certificate whose issuer has no CRL here passes (rustls `allow_unknown_revocation_status`). Re-read when the
+    /// script calls `proxy.reload_client_crl()` (the file watcher needs inotify). Optional; without it no revocation
+    /// check is made.
+    #[serde(default)]
+    pub client_crl: Option<String>,
     /// PEM certificate chain siphon presents as a TLS *client* on OUTBOUND
     /// connections when the upstream peer requests one (mutual TLS — upstream
     /// SIP trunks that require client-certificate auth). Optional; when unset,

@@ -99,17 +99,16 @@ pub(crate) fn client_cert_verifier(
             )
         })?;
     }
-    let chain_verifier = rustls::server::WebPkiClientVerifier::builder_with_provider(
-        Arc::new(roots),
-        crate::transport::tls::crypto_provider(),
-    )
-    .build()
-    .map_err(|error| {
-        io::Error::new(
-            io::ErrorKind::InvalidData,
-            format!("{field_prefix}: building the client certificate verifier: {error}"),
-        )
-    })?;
+    let roots = Arc::new(roots);
+    let chain_verifier: Arc<dyn ClientCertVerifier> = match tls_config.client_crl.as_deref() {
+        None => build_chain_verifier(Arc::clone(&roots), None, field_prefix)?,
+        Some(crl_path) => {
+            let verifier = Arc::new(CrlChainVerifier::new(roots, crl_path, field_prefix)?);
+            register_crl_verifier(&verifier);
+            info!(client_crl = %crl_path, listener = %field_prefix, "client certificate revocation list loaded");
+            verifier
+        }
+    };
 
     if tls_config.client_subject.is_empty() {
         info!(client_ca = %ca_path, listener = %field_prefix,
@@ -129,6 +128,206 @@ pub(crate) fn client_cert_verifier(
         inner: chain_verifier,
         subjects,
     })))
+}
+
+/// The WebPKI chain verifier for `roots`, with the revocation list at `crl_path` when there is one.
+fn build_chain_verifier(
+    roots: Arc<rustls::RootCertStore>,
+    crl_path: Option<&str>,
+    field_prefix: &str,
+) -> io::Result<Arc<dyn ClientCertVerifier>> {
+    let mut builder = rustls::server::WebPkiClientVerifier::builder_with_provider(
+        roots,
+        crate::transport::tls::crypto_provider(),
+    );
+    if let Some(path) = crl_path {
+        builder = builder
+            .with_crls(read_crls(path, field_prefix)?)
+            .only_check_end_entity_revocation()
+            .allow_unknown_revocation_status();
+    }
+    builder.build().map(|verifier| verifier as Arc<dyn ClientCertVerifier>).map_err(|error| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("{field_prefix}: building the client certificate verifier: {error}"),
+        )
+    })
+}
+
+/// The CRLs in a file: PEM (`X509 CRL` blocks) or one DER CRL.
+fn read_crls(
+    path: &str,
+    field_prefix: &str,
+) -> io::Result<Vec<rustls_pki_types::CertificateRevocationListDer<'static>>> {
+    // The issuer of the list rewrites it in place (truncate, then write): a read that lands in between sees a short or
+    // zero-filled file. A few tries, a quarter of a second apart, ride that out; a list that stays unreadable is an error.
+    let mut attempt = 0;
+    loop {
+        match read_crls_once(path, field_prefix) {
+            Ok(crls) => return Ok(crls),
+            Err(error) if attempt >= 8 => return Err(error),
+            Err(error) => {
+                attempt += 1;
+                warn!(%error, attempt, "client_crl not readable (being rewritten?), trying again");
+                std::thread::sleep(std::time::Duration::from_millis(250));
+            }
+        }
+    }
+}
+
+fn read_crls_once(
+    path: &str,
+    field_prefix: &str,
+) -> io::Result<Vec<rustls_pki_types::CertificateRevocationListDer<'static>>> {
+    use rustls_pki_types::pem::PemObject;
+    use rustls_pki_types::CertificateRevocationListDer;
+
+    let bytes = std::fs::read(path).map_err(|error| {
+        io::Error::new(error.kind(), format!("{field_prefix}.client_crl '{path}': {error}"))
+    })?;
+    if bytes.windows(10).any(|window| window == b"-----BEGIN") {
+        CertificateRevocationListDer::pem_slice_iter(&bytes)
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|error| {
+                let head: String = bytes.iter().take(48).map(|b| format!("{b:02x}")).collect();
+                let first_nul = bytes.iter().position(|&b| b == 0);
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!(
+                        "parsing {field_prefix}.client_crl '{path}': {error} (read {} bytes at {:p}, first NUL at {first_nul:?}, zero bytes {}, head {head})",
+                        bytes.len(),
+                        bytes.as_ptr(),
+                        bytes.iter().filter(|&&b| b == 0).count()
+                    ),
+                )
+            })
+    } else if bytes.is_empty() {
+        Err(io::Error::new(io::ErrorKind::InvalidData, format!("{field_prefix}.client_crl '{path}' is empty")))
+    } else {
+        Ok(vec![CertificateRevocationListDer::from(bytes)])
+    }
+}
+
+/// The chain verifier with a revocation list that is read again on demand: the verifier a listener holds stays the
+/// same object, the WebPKI verifier inside it is replaced. A list that cannot be read keeps the one in force.
+struct CrlChainVerifier {
+    inner: std::sync::RwLock<Arc<dyn ClientCertVerifier>>,
+    roots: Arc<rustls::RootCertStore>,
+    crl_path: String,
+    field_prefix: String,
+    hints: Vec<DistinguishedName>,
+}
+
+impl std::fmt::Debug for CrlChainVerifier {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("CrlChainVerifier").field("crl_path", &self.crl_path).finish()
+    }
+}
+
+impl CrlChainVerifier {
+    fn new(roots: Arc<rustls::RootCertStore>, crl_path: &str, field_prefix: &str) -> io::Result<Self> {
+        let inner = build_chain_verifier(Arc::clone(&roots), Some(crl_path), field_prefix)?;
+        let hints = inner.root_hint_subjects().to_vec();
+        Ok(Self {
+            inner: std::sync::RwLock::new(inner),
+            roots,
+            crl_path: crl_path.to_string(),
+            field_prefix: field_prefix.to_string(),
+            hints,
+        })
+    }
+
+    fn reload(&self) -> io::Result<()> {
+        let fresh = build_chain_verifier(Arc::clone(&self.roots), Some(&self.crl_path), &self.field_prefix)?;
+        *self.inner.write().unwrap_or_else(|poisoned| poisoned.into_inner()) = fresh;
+        Ok(())
+    }
+
+    fn current(&self) -> Arc<dyn ClientCertVerifier> {
+        Arc::clone(&self.inner.read().unwrap_or_else(|poisoned| poisoned.into_inner()))
+    }
+}
+
+impl ClientCertVerifier for CrlChainVerifier {
+    fn offer_client_auth(&self) -> bool {
+        true
+    }
+
+    fn client_auth_mandatory(&self) -> bool {
+        true
+    }
+
+    fn root_hint_subjects(&self) -> &[DistinguishedName] {
+        &self.hints
+    }
+
+    fn verify_client_cert(
+        &self,
+        end_entity: &CertificateDer<'_>,
+        intermediates: &[CertificateDer<'_>],
+        now: UnixTime,
+    ) -> Result<ClientCertVerified, rustls::Error> {
+        self.current().verify_client_cert(end_entity, intermediates, now)
+    }
+
+    fn verify_tls12_signature(
+        &self,
+        message: &[u8],
+        certificate: &CertificateDer<'_>,
+        signature: &DigitallySignedStruct,
+    ) -> Result<HandshakeSignatureValid, rustls::Error> {
+        self.current().verify_tls12_signature(message, certificate, signature)
+    }
+
+    fn verify_tls13_signature(
+        &self,
+        message: &[u8],
+        certificate: &CertificateDer<'_>,
+        signature: &DigitallySignedStruct,
+    ) -> Result<HandshakeSignatureValid, rustls::Error> {
+        self.current().verify_tls13_signature(message, certificate, signature)
+    }
+
+    fn supported_verify_schemes(&self) -> Vec<SignatureScheme> {
+        self.current().supported_verify_schemes()
+    }
+
+    fn requires_raw_public_keys(&self) -> bool {
+        false
+    }
+}
+
+static CRL_VERIFIERS: std::sync::Mutex<Vec<std::sync::Weak<CrlChainVerifier>>> = std::sync::Mutex::new(Vec::new());
+
+fn register_crl_verifier(verifier: &Arc<CrlChainVerifier>) {
+    CRL_VERIFIERS
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .push(Arc::downgrade(verifier));
+}
+
+/// Read the client certificate revocation list again on every listener that has one. Returns how many listeners now
+/// hold the fresh list; a listener whose list cannot be read keeps the old one and is named in the error.
+pub(crate) fn reload_client_crls() -> Result<usize, String> {
+    let mut registry = CRL_VERIFIERS.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+    registry.retain(|weak| weak.strong_count() > 0);
+    let mut reloaded = 0;
+    let mut failures = Vec::new();
+    for verifier in registry.iter().filter_map(std::sync::Weak::upgrade) {
+        match verifier.reload() {
+            Ok(()) => reloaded += 1,
+            Err(error) => {
+                warn!(%error, listener = %verifier.field_prefix, "client certificate revocation list not reloaded");
+                failures.push(error.to_string());
+            }
+        }
+    }
+    if failures.is_empty() {
+        info!(listeners = reloaded, "client certificate revocation list reloaded");
+        Ok(reloaded)
+    } else {
+        Err(failures.join("; "))
+    }
 }
 
 /// The DNS identities a `client_subject` list allows, matched

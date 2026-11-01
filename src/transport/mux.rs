@@ -671,6 +671,7 @@ mod tests {
             verify_client: false,
             client_ca: None,
             client_subject: Vec::new(),
+            client_crl: None,
             client_certificate: None,
             client_private_key: None,
             verify_server: false,
