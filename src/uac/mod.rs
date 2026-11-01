@@ -748,6 +748,28 @@ impl UacSender {
         connection_id: ConnectionId,
         source_local_addr: Option<SocketAddr>,
     ) -> oneshot::Receiver<UacResult> {
+        self.send_request_with_response_named(
+            message,
+            destination,
+            transport,
+            connection_id,
+            source_local_addr,
+            None,
+        )
+    }
+
+    /// [`send_request_with_response_on`](Self::send_request_with_response_on) that also names the host the next hop
+    /// was routed on: a new outbound TLS connection presents it as SNI and, with `tls.verify_server`, checks the
+    /// peer's certificate against it (RFC 5922) instead of against the resolved address.
+    pub fn send_request_with_response_named(
+        &self,
+        message: SipMessage,
+        destination: SocketAddr,
+        transport: Transport,
+        connection_id: ConnectionId,
+        source_local_addr: Option<SocketAddr>,
+        server_name: Option<String>,
+    ) -> oneshot::Receiver<UacResult> {
         let (sender, receiver) = oneshot::channel();
 
         // Extract branch from the topmost Via.  If absent or not UAC-shaped,
@@ -789,7 +811,7 @@ impl UacSender {
             destination,
             data,
             source_local_addr,
-            server_name: None,
+            server_name,
             verify_server: None,
         };
 

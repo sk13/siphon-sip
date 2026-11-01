@@ -1000,7 +1000,16 @@ impl PyProxyUtils {
             // exists only so the dispatcher's `UacSender::match_response`
             // silently consumes the matching response — without it, every
             // legitimate response logs "response for unknown branch (not ours)".
-            let receiver = uac.send_request_with_response(message, target.address, transport);
+            // The host the next hop was routed on is the name a verified TLS connection is checked against.
+            let tls_server_name = (transport == Transport::Tls).then(|| host.clone());
+            let receiver = uac.send_request_with_response_named(
+                message,
+                target.address,
+                transport,
+                crate::transport::ConnectionId::default(),
+                None,
+                tls_server_name,
+            );
             await_send_request_reply(uac, receiver, branch, wait_for_response, timeout).await
         })
     }
