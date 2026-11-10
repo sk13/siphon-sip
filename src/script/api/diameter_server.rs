@@ -194,6 +194,11 @@ pub struct PyInboundPeer {
     pub addr: String,
     #[pyo3(get)]
     pub transport: String,
+    /// The Origin-Host the peer gave in its CER or CEA: the identity of the
+    /// peer the request was received from, which a relay records in
+    /// Route-Record (RFC 6733 section 6.1.9). Empty when not known.
+    #[pyo3(get)]
+    pub host: String,
 }
 
 // ── PyPeer (backend, from a pool pick) ──────────────────────────────────────
@@ -207,6 +212,27 @@ pub struct PyPeer {
     pub(crate) client: Arc<DiameterClient>,
     name: String,
     tenant: String,
+    /// The other open peers of the pool this one was picked from: where
+    /// `forward_to` sends the request once when this one cannot serve it and
+    /// `diameter.retry` allows it.
+    alternates: Vec<Arc<DiameterClient>>,
+}
+
+impl PyPeer {
+    /// A handle for the open connection `peer`, of the configured peer `name`
+    /// in `tenant`.
+    pub(crate) fn for_connection(
+        peer: Arc<crate::diameter::peer::DiameterPeer>,
+        name: String,
+        tenant: String,
+    ) -> Self {
+        Self {
+            client: Arc::new(DiameterClient::new(peer)),
+            name,
+            tenant,
+            alternates: Vec::new(),
+        }
+    }
 }
 
 #[pymethods]
@@ -243,29 +269,33 @@ impl PyPeerPool {
     }
 }
 
-fn peer_from_named(tenant: &str, named: Option<(String, Arc<DiameterClient>)>) -> Option<PyPeer> {
+fn peer_from_named(
+    pool: &PeerPool,
+    named: Option<(String, Arc<DiameterClient>)>,
+) -> Option<PyPeer> {
     named.map(|(name, client)| PyPeer {
+        alternates: pool.alternates_to(&client),
         client,
         name,
-        tenant: tenant.to_string(),
+        tenant: pool.tenant().to_string(),
     })
 }
 
 #[pymethods]
 impl PyPeerPool {
     fn pick_round_robin(&self) -> Option<PyPeer> {
-        peer_from_named(self.pool.tenant(), self.pool.pick_round_robin_named())
+        peer_from_named(&self.pool, self.pool.pick_round_robin_named())
     }
 
     #[pyo3(signature = (weights))]
     fn pick_weighted(&self, weights: HashMap<String, u32>) -> Option<PyPeer> {
-        peer_from_named(self.pool.tenant(), self.pool.pick_weighted_named(&weights))
+        peer_from_named(&self.pool, self.pool.pick_weighted_named(&weights))
     }
 
     #[pyo3(signature = (key, ttl_secs=300.0))]
     fn pick_sticky(&self, key: &str, ttl_secs: f64) -> Option<PyPeer> {
         let ttl = Duration::from_secs_f64(ttl_secs.max(0.0));
-        peer_from_named(self.pool.tenant(), self.pool.pick_sticky_named(key, ttl))
+        peer_from_named(&self.pool, self.pool.pick_sticky_named(key, ttl))
     }
 
     #[getter]
@@ -1025,17 +1055,31 @@ impl PyDiameterRequest {
         let local_origin_realm = self.local_origin_realm.clone();
         let inbound_hbh = self.inbound_hbh;
         let inbound_e2e = self.inbound_e2e;
+        let previous_hop = self.peer.host.clone();
         let client = Arc::clone(&peer.client);
+        let alternates = peer.alternates.clone();
         let timeout = Duration::from_secs_f64(timeout_secs.max(0.1));
 
         crate::script::awaitable(py, async move {
-            // Optional topology hiding.
+            // Every identity this node uses on the request: its own and the
+            // one it may put in the request's place (topology hiding).
+            let mut identities = vec![local_origin_host.clone()];
             if let Some((origin_host, origin_realm)) = identity {
                 forward::rewrite_origin(&mut tree, &origin_host, &origin_realm);
+                identities.push(origin_host);
             }
+            // The peer it came from; for a connection whose peer gave no
+            // identity, the request's own origin.
+            let previous_hop = if previous_hop.is_empty() {
+                tree.get_str(dictionary::avp::ORIGIN_HOST)
+                    .unwrap_or_default()
+            } else {
+                previous_hop
+            };
 
             // Loop detection + Route-Record append.
-            if let Err(error) = forward::prepare_forward(&mut tree, &local_origin_host) {
+            let identities: Vec<&str> = identities.iter().map(String::as_str).collect();
+            if let Err(error) = forward::prepare_forward(&mut tree, &identities, &previous_hop) {
                 let answer = forward::build_error_answer(
                     &tree,
                     &local_origin_host,
@@ -1046,11 +1090,24 @@ impl PyDiameterRequest {
                 return Ok(PyDiameterAnswer::from_msg(answer));
             }
 
-            // Fresh outbound hop-by-hop; End-to-End is preserved.
+            // Fresh outbound hop-by-hop; End-to-End is preserved. Every answer
+            // this node makes from here on goes back with the inbound one
+            // (RFC 6733 section 6.2).
             tree.hop_by_hop = client.peer().next_hbh();
             let wire = tree.to_wire();
+            tree.hop_by_hop = inbound_hbh;
 
-            match client.peer().send_request_timeout(wire, timeout).await {
+            let policy = crate::diameter::retry::current();
+            let sent = crate::diameter::retry::send_routed(
+                &policy,
+                &client,
+                &alternates,
+                wire,
+                timeout,
+                crate::diameter::overload::Origin::Relayed,
+            )
+            .await;
+            match sent {
                 Ok(answer_message) => {
                     // Rebuild the lossless tree from the answer's raw bytes and
                     // restore the inbound hbh/e2e so it correlates upstream.
@@ -1121,6 +1178,7 @@ mod tests {
                 tenant: "default".into(),
                 addr: "10.0.0.5:5000".into(),
                 transport: "tcp".into(),
+                host: String::new(),
             },
             "diam.epc.example.org".into(),
             "epc.example.org".into(),
@@ -1350,6 +1408,7 @@ mod tests {
                 tenant: "default".into(),
                 addr: "192.0.2.7:3868".into(),
                 transport: "tcp".into(),
+                host: String::new(),
             },
             "scscf.ims.mnc001.mcc001.3gppnetwork.org".into(),
             "ims.mnc001.mcc001.3gppnetwork.org".into(),
@@ -2084,6 +2143,7 @@ mod tests {
                 tenant: "default".into(),
                 addr: "192.0.2.5:5000".into(),
                 transport: "tcp".into(),
+                host: String::new(),
             },
             "hss.ims.mnc001.mcc001.3gppnetwork.org".into(),
             "ims.mnc001.mcc001.3gppnetwork.org".into(),
@@ -2279,6 +2339,7 @@ mod tests {
                 tenant: "default".into(),
                 addr: "192.0.2.7:3868".into(),
                 transport: "tcp".into(),
+                host: String::new(),
             },
             "scscf.ims.mnc001.mcc001.3gppnetwork.org".into(),
             "ims.mnc001.mcc001.3gppnetwork.org".into(),

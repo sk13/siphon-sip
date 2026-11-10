@@ -1,6 +1,6 @@
 [package]
 name = "siphon-sip"
-version = "1.15.11"
+version = "1.15.12"
 edition = "2021"
 rust-version = "1.89"
 license = "MIT"
@@ -98,8 +98,9 @@ http = "1"
 # handler needs the peer certificate (to bind `admfIdentifier` to it) and the
 # TLS acceptor has to be ours to get at it. Both crates are already in the
 # tree via axum/reqwest; naming them here adds no new supply chain.
-hyper = { version = "1", features = ["server", "http1"] }
-hyper-util = { version = "0.1", features = ["tokio"] }
+hyper = { version = "1", features = ["server", "http1", "http2"] }
+# SBI notification TLS serves the axum Router over HTTP/2 or HTTP/1.1.
+hyper-util = { version = "0.1", features = ["tokio", "server-auto", "service"] }
 http-body-util = "0.1"
 
 # Diameter AVP decoding
@@ -142,7 +143,7 @@ tracing-appender = "0.2"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
 
 # Registrar persistence backends (optional, feature-flagged)
-redis = { version = "1", features = ["tokio-comp"], optional = true }
+redis = { version = "1", features = ["tokio-comp", "sentinel"], optional = true }
 tokio-postgres = { version = "0.7", optional = true }
 prometheus = { version = "0.14", features = ["process"] }
 axum = { version = "0.8.8", features = ["tokio", "ws"] }

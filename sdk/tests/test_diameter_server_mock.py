@@ -2,6 +2,8 @@
 
 import asyncio
 
+import pytest
+
 from siphon_sdk import mock_module
 
 
@@ -477,3 +479,32 @@ def test_avp_flags_and_unknown_mandatory_avps_answer_5001():
 
     assert req.reject_unsupported_avps(understood=[(64000, 10415)]) is None
     assert mock_module.MockDiameterRequest().reject_unsupported_avps() is None
+
+
+def test_peer_for_host_finds_a_connected_peer_by_origin_host():
+    diameter = _fresh_diameter()
+    diameter.add_peer_host("mme-1.epc.example.org", "mme", tenant="epc")
+    diameter.add_peer_host("mme-2.epc.example.org", "mme-b", tenant="epc", connected=False)
+
+    from siphon import diameter as d
+
+    peer = d.peer_for_host("MME-1.epc.example.org", tenant="epc")
+    assert peer is not None and peer.name == "mme" and peer.tenant == "epc"
+    assert peer.host == "MME-1.epc.example.org"
+    assert d.peer_for_host("mme-1.epc.example.org") is None  # another tenant
+    assert d.peer_for_host("mme-2.epc.example.org", tenant="epc") is None  # closed
+    assert d.peer_for_host("mme-9.epc.example.org", tenant="epc") is None
+
+
+def test_set_overload_records_the_reported_reduction_and_validates_the_range():
+    diameter = _fresh_diameter()
+
+    from siphon import diameter as d
+
+    assert d.set_overload(40, validity_secs=30) is True
+    assert diameter.overload_reduction == 40
+    assert diameter.overload_validity == 30
+    assert d.set_overload(0) is True
+    assert diameter.overload_reduction == 0
+    with pytest.raises(ValueError):
+        d.set_overload(101)

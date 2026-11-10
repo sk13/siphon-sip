@@ -33,7 +33,7 @@ fn unique_prefix(test: &str) -> String {
 
 async fn backend(url: &str, prefix: &str, slack: u64, max_lifetime: u64) -> RedisBackend {
     RedisBackend::connect(RedisBackendConfig {
-        url: url.to_string(),
+        target: (url.to_string()).into(),
         key_prefix: prefix.to_string(),
         ttl_slack_secs: slack,
         ..RedisBackendConfig::default()
@@ -78,10 +78,17 @@ async fn keys_under(url: &str, prefix: &str) -> BTreeSet<String> {
 async fn real_aors(url: &str, prefix: &str) -> BTreeSet<String> {
     let state = format!("{prefix}state:");
     let index = format!("{prefix}index");
+    let alias = format!("{prefix}alias:");
+    let claim = format!("{prefix}expired:");
     keys_under(url, prefix)
         .await
         .into_iter()
-        .filter(|key| !key.starts_with(&state) && *key != index)
+        .filter(|key| {
+            !key.starts_with(&state)
+                && !key.starts_with(&alias)
+                && !key.starts_with(&claim)
+                && *key != index
+        })
         .map(|key| key[prefix.len()..].to_string())
         .collect()
 }

@@ -38,10 +38,89 @@ matches = isc.evaluate(
 5G Service-Based Interface — N5/Npcf policy authorization plus Nbsf_Management
 PCF discovery.
 
+### Outbound TLS
+
+Use HTTPS endpoint URLs for TLS on SBI (TS 33.501 clause 13.1). The optional
+`tls` block applies to the manager's HTTP client and the Npcf and Nbsf clients
+created at startup:
+
+```yaml
+sbi:
+  npcf_url: "https://pcf.example.com"
+  bsf_url: "https://bsf.example.com"
+  tls:
+    ca: "${SBI_TLS_DIR}/ca.pem"
+    cert: "${SBI_TLS_DIR}/client-chain.pem"
+    key: "${SBI_TLS_DIR}/client-key.pem"
+    trust_public_roots: true
+```
+
+`ca` is an optional PEM bundle of trusted CA certificates. `cert` is a PEM
+client certificate chain (leaf first), and `key` is its PEM private key; both
+must be supplied together for mutual TLS. Paths support the usual `${VAR}`
+expansion. `trust_public_roots` defaults to `true`, adding the configured CAs
+to the public roots. Set it to `false` to trust only the supplied CAs. Omitting
+`tls` preserves public roots and sends no client certificate.
+
+Unreadable files, invalid certificates or keys, mismatched identities, and
+HTTP client construction failures stop startup with an error. Files are read
+once when the manager is created. Restart after certificate or CA rotation,
+including cert-manager updates: SIGHUP and script reload do not rebuild this
+manager. This block configures outbound connections, not the callback listener.
+
+Rust consumers should handle the `Result` returned by `SbiManager::new` and
+clone `manager.client()` for Npcf, Nbsf, Nchf, or other SBI requests.
+`client_with_timeout` builds a client with the same cached TLS material and a
+different timeout. NRF discovery and access-token requests are not yet
+implemented; future implementations must use this configured client too.
+
+### Static bearer authentication
+
+For an SCP or producer that authenticates consumers with a pre-shared token:
+
+```yaml
+sbi:
+  npcf_url: "https://pcf.example.com"
+  bsf_url: "https://bsf.example.com"
+  bearer_token_file: "${SBI_TOKEN_DIR}/bearer-token"
+```
+
+An empty `bearer_token_file`, `ca`, `cert` or `key` is unset, so a shared
+configuration can take each from the environment (`"${SBI_CA_FILE:-}"`) and
+leave it out where the variable is not set.
+
+The optional path supports normal environment expansion and can be used alongside
+`sbi.tls`. The file is read once at startup, with surrounding whitespace trimmed.
+Empty or unreadable files and tokens outside RFC 6750's `b64token` grammar stop
+startup with an error naming the file. Tokens contain ASCII letters, digits,
+`-`, `.`, `_`, `~`, `+`, or `/`, optionally followed by trailing `=` padding.
+Token values are redacted from Debug output.
+
+Every client built by `SbiManager`, including timeout-specific clients, sends
+`Authorization: Bearer <token>` unless the request supplies its own Authorization
+header. Omitting the setting preserves the existing behavior. Restart to rotate
+the token; reload does not reread it.
+
+A token that identifies the consumer to the SCP it sends through goes in
+`Proxy-Authorization` instead (RFC 9110 section 11.7.2), which leaves
+`Authorization` to a producer's access token:
+
+```yaml
+sbi:
+  bearer_token_file: "${SBI_TOKEN_DIR}/scp-token"
+  bearer_token_header: proxy-authorization   # default: authorization
+```
+
+With a token configured, `npcf_url`, `bsf_url`, `nchf_url`, and `nrf_url` must
+use HTTPS, except that HTTP is allowed for loopback IP literals and `localhost`.
+Remote HTTP endpoints fail startup. Use HTTPS for dynamically discovered PCF
+endpoints too (`pcf_scheme: https`); startup validation covers configured URLs.
+Rust consumers must supply their peer URLs in `SbiConfig` for this validation.
+
 ### PCF callbacks
 
-The PCF calls back over HTTP on the address in `sbi.notif_listen`. Advertise
-`http://<notif_listen>/sbi/events` as `notif_uri`; the PCF appends the
+The PCF calls back on the address in `sbi.notif_listen` (plain HTTP by default).
+Advertise the externally reachable callback base as `notif_uri`; the PCF appends the
 TS 29.514 suffix for each callback, so one listener serves both.
 
 `notifUri` is a required attribute of the create (TS 29.514), so
@@ -55,6 +134,36 @@ sbi:
   notif_listen: "0.0.0.0:8080"
   notif_uri: "http://192.0.2.10:8080/sbi/events"   # how the PCF reaches notif_listen
 ```
+
+To serve HTTPS directly, configure `notif_tls`. TLS negotiates `h2` through
+ALPN for TS 29.500 HTTP/2, with `http/1.1` as a fallback:
+
+```yaml
+sbi:
+  notif_listen: "0.0.0.0:8443"
+  notif_uri: "https://notif.example.net:8443/sbi/events"
+  notif_tls:
+    cert: "${SBI_NOTIF_CERT:-}"
+    key: "${SBI_NOTIF_KEY:-}"
+    client_ca: "${SBI_NOTIF_CLIENT_CA:-}"
+```
+
+`cert` is the PEM server certificate chain (leaf first); `key` is its PEM
+private key. Set both environment variables to enable TLS. A nonempty
+`client_ca` names a PEM CA bundle: clients must present a certificate verified
+against it (mutual TLS). Without it, no client certificate is requested.
+These inbound settings are independent of the outbound `sbi.tls` settings.
+
+Empty paths count as unset. With no `notif_tls`, or both `cert` and `key`
+unset, the listener stays plain HTTP; `client_ca` alone does not enable TLS.
+Setting only one of `cert` and `key` fails startup. Unreadable or invalid TLS
+files fail startup and name the offending file; there is no fallback to HTTP.
+Files are loaded once at startup; restart to rotate certificates or trust anchors.
+Handshake failures affect only that connection.
+
+`notif_uri` is always the operator's advertised URI and is never rewritten.
+Use `https://` when the PCF reaches a TLS endpoint, accounting for any proxy
+or address translation in front of the listener.
 
 | Route | Body (verbatim dict) | Hook |
 |---|---|---|

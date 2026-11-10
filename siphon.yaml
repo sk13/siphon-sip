@@ -10,9 +10,12 @@
 # Environment variable expansion:
 #   Any value can reference environment variables with ${VAR} syntax.
 #   Use ${VAR:-default} to provide a fallback when the variable is unset or empty.
+#   A fallback may name another variable, so one setting falls back on another:
+#   ${LISTEN_ADDRESS:-${ADVERTISED_ADDRESS:-192.0.2.10}}.
 #
 #   Examples:
 #     url: "redis://${REDIS_HOST:-localhost}:6379"
+#     url: "${REDIS_URL:-redis://${REDIS_HOST:-localhost}:6379}"
 #     - "${LISTEN_IP:-0.0.0.0}:5060"
 #     cert: "${TLS_CERT_PATH:-/etc/siphon/tls/cert.pem}"
 
@@ -398,8 +401,21 @@ registrar:
   # Survives restarts; required when RTPEngine or dialog state also uses Redis.
   # redis:
   #   url: "redis://127.0.0.1:6379"
+  #   # Or a Redis / Valkey Sentinel group instead of url (exactly one of the
+  #   # two). The primary is rediscovered after a failover; iFC and presence
+  #   # persistence use the same target. See docs/deployment.md.
+  #   # sentinel:
+  #   #   addresses: ["192.0.2.10:26379", "192.0.2.11:26379", "192.0.2.12:26379"]
+  #   #   master: primary
+  #   #   password: "${REDIS_PASSWORD}"             # optional, data nodes
+  #   #   sentinel_password: "${SENTINEL_PASSWORD}" # optional, Sentinels
+  #   #   db: 0                                     # optional, default 0
+  #   # Sharded: shard_count plus urls, each a URL string or a sentinel: mapping.
   #   key_prefix: "siphon:reg:"   # namespace prefix (default: "siphon:reg:")
   #   ttl_slack_secs: 30          # extra seconds beyond expires for race safety
+  #   read_through_ttl_ms: 1000   # how long a node serves an AoR from memory before
+  #   # reading Redis again: the bound on how stale another node's registration,
+  #   # refresh or removal can look. 0 = memory only (no read-through).
   #   presence_key_prefix: "siphon:presence:"
   #   # presence subscriptions (presence.subscribe_dialog) are written through
   #   # to this Redis under their own prefix and restored at boot, so a
@@ -1040,6 +1056,7 @@ auth:
 # cache:
 #   - name: "cnam"
 #     url: "redis://127.0.0.1:6379"
+#     # or sentinel: {addresses: [...], master: primary}, as for the registrar
 #     local_ttl_secs: 60       # optional in-process LRU in front of Redis
 #     local_max_entries: 10000
 
@@ -2199,9 +2216,24 @@ auth:
 #   product_name: "SIPhon"              # advertised in CER/CEA (default: SIPhon)
 #   transport: tcp                       # tcp | sctp (default for all peers)
 #   watchdog_interval: 30                # DWR/DWA interval in seconds
-#   reconnect_delay: 5                   # seconds between reconnect attempts
+#   resolve_interval: 30                 # DNS group refresh in seconds
+#   reconnect_delay: 5                   # first reconnect wait in seconds; doubles per attempt
+#   reconnect_delay_max: 60              # ceiling of the reconnect backoff in seconds
+#   overload:                            # DOIC, RFC 7683 (off unless set)
+#     reacting: {action: reject}         # advertise DOIC, abate what reports ask; reject | divert
+#   retry:                               # send once to another peer on 3004/3002/timeout
+#     - {application: s6a, commands: [AIR], on: [too_busy, unable_to_deliver]}
+#     reporting: {validity: 30, pending_requests: {start: 200, full: 1000, max_reduction: 80}}
+#   # peers/servers/connect_to entries also take source_address: 192.0.2.10 (bind before connect)
+#   reopen_watchdog_answers: 3           # watchdogs a reconnected peer answers before it takes traffic
+#   disconnect_timeout_ms: 1000          # wait for the DPA when a connection is closed on purpose
 
 #   peers:
+#     # Optional DNS group (also supported on servers and tenants.<t>.servers):
+#     # - name: dra
+#     #   host: dra.example.net
+#     #   destination_realm: example.net
+#     #   all_addresses: true             # Default false; one connection per address
 #     - name: "hss1"
 #       host: "hss1.example.com"
 #       port: 3868

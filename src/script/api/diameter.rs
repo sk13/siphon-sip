@@ -2163,6 +2163,75 @@ impl PyDiameter {
         Ok(crate::script::api::diameter_server::PyPeerPool::new(pool))
     }
 
+    /// The directly connected peer whose Origin-Host is `host`, for
+    /// `request.forward_to`, or None when no open connection has it.
+    ///
+    /// Covers every connection of a Diameter server, whichever side opened
+    /// it: backends in `servers`, upstreams in `connect_to` and clients that
+    /// dialled in. A peer is known by the Origin-Host it gave in its CER or
+    /// CEA, compared without regard to case, from the moment the connection
+    /// opens. A relay sends a request whose Destination-Host is a directly
+    /// connected peer to that peer (RFC 6733 section 6.1.6):
+    ///
+    /// ```python,ignore
+    /// peer = diameter.peer_for_host(req.dest_host, tenant=req.peer.tenant)
+    /// if peer is not None:
+    ///     return await req.forward_to(peer)
+    /// ```
+    ///
+    /// `tenant` defaults to `"default"`, the tenant of a single-domain server.
+    #[pyo3(signature = (host, tenant=None))]
+    fn peer_for_host(
+        &self,
+        host: &str,
+        tenant: Option<String>,
+    ) -> Option<crate::script::api::diameter_server::PyPeer> {
+        let tenant = tenant.unwrap_or_else(|| "default".to_string());
+        let (name, peer) = crate::diameter::directory::find(&tenant, host)?;
+        Some(crate::script::api::diameter_server::PyPeer::for_connection(
+            peer, name, tenant,
+        ))
+    }
+
+    /// Report overload (RFC 7683): ask the nodes that send this one requests
+    /// to abate `reduction_percentage` percent of them (0 to 100), for
+    /// `validity_secs` seconds, or until it is set again when that is not
+    /// given. 0 ends the overload. The report goes in the answers to
+    /// requests that advertised DOIC; the pending-request depth, when
+    /// `diameter.overload.reporting.pending_requests` is configured, counts
+    /// too and the larger of the two is reported.
+    ///
+    /// Returns False, and does nothing, when `diameter.overload.reporting` is
+    /// not configured.
+    ///
+    /// ```python,ignore
+    /// if queue_depth() > LIMIT:
+    ///     diameter.set_overload(40, validity_secs=30)
+    /// else:
+    ///     diameter.set_overload(0)
+    /// ```
+    #[pyo3(signature = (reduction_percentage, validity_secs=None))]
+    fn set_overload(
+        &self,
+        reduction_percentage: u32,
+        validity_secs: Option<f64>,
+    ) -> PyResult<bool> {
+        if reduction_percentage > 100 {
+            return Err(pyo3::exceptions::PyValueError::new_err(
+                "reduction_percentage is 0 to 100",
+            ));
+        }
+        let overload = crate::diameter::overload::current();
+        let Some(reporting) = overload.reporting.as_ref() else {
+            return Ok(false);
+        };
+        let lasts = validity_secs
+            .filter(|secs| *secs > 0.0)
+            .map(std::time::Duration::from_secs_f64);
+        reporting.set(reduction_percentage, lasts, std::time::Instant::now());
+        Ok(true)
+    }
+
     /// Whether `addr` falls within `cidr` (helper for routing scripts).
     #[staticmethod]
     fn ip_in_cidr(addr: &str, cidr: &str) -> PyResult<bool> {
@@ -2846,9 +2915,25 @@ impl PyDiameter {
 
         let command = command.to_string();
         let timeout = request_timeout(timeout_ms);
+        // Another peer takes it only when the script did not name one and the
+        // request is not addressed to a host.
+        let alternates = if peer.is_none() && config.destination_host.is_none() {
+            self.manager.alternates_to(&client)
+        } else {
+            Vec::new()
+        };
 
         crate::script::awaitable(python, async move {
-            let answer = client.peer().send_request_timeout(wire, timeout).await;
+            let policy = crate::diameter::retry::current();
+            let answer = crate::diameter::retry::send_routed(
+                &policy,
+                &client,
+                &alternates,
+                wire,
+                timeout,
+                crate::diameter::overload::Origin::Local,
+            )
+            .await;
             let message = match answer {
                 Ok(message) => message,
                 Err(error) => {
@@ -4146,6 +4231,8 @@ mod tests {
                 application_ids: vec![],
                 watchdog_interval: 30,
                 reconnect_delay: 5,
+                source_address: None,
+                lifecycle: Default::default(),
                 product_name: "SIPhon".to_string(),
                 firmware_revision: 100,
             };
@@ -4510,6 +4597,8 @@ mod tests {
             application_ids: vec![],
             watchdog_interval: 30,
             reconnect_delay: 5,
+            source_address: None,
+            lifecycle: Default::default(),
             product_name: "SIPhon".to_string(),
             firmware_revision: 1,
         }

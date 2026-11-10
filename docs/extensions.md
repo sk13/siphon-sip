@@ -282,6 +282,81 @@ in the **siphon-sigtran** docs and repository:
 - 📖 Documentation: <https://sigtran.siphon-sip.org/>
 - 💻 Source: <https://github.com/siphon-project/siphon-sigtran>
 
+## Rust addons: taking part in readiness, drain and shutdown
+
+A Rust addon that owns long-lived state siphon cannot see (sessions over a
+protocol of its own, sockets it binds itself, an upstream peer it depends on)
+registers a **lifecycle participant** on the builder, next to its namespaces and
+tasks:
+
+```rust
+use std::sync::Arc;
+use siphon::{LifecycleParticipant, SiphonServer};
+
+struct Sessions { /* … */ }
+
+impl LifecycleParticipant for Sessions {
+    fn ready(&self) -> Result<(), String> { /* Err("no upstream peer up".into()) */ Ok(()) }
+    fn set_draining(&self, draining: bool) { /* stop admitting, wind sessions down */ }
+    fn outstanding(&self) -> usize { /* sessions still held */ 0 }
+    fn force(&self) { /* the deadline passed: tear down what is left */ }
+}
+
+SiphonServer::builder()
+    .config_path("siphon.yaml")
+    .register_lifecycle(Arc::new(Sessions { /* … */ }))
+    .run();
+```
+
+Several participants may be registered. Without any, readiness, drain and
+shutdown behave as they always have.
+
+| Where | What siphon does with the participants |
+|---|---|
+| `GET /admin/ready` | 200, unless draining (503 `draining`) or a participant's `ready()` returns `Err`: 503 `{"status": "not_ready", "reason": "<first reason>"}`, polled in registration order |
+| `POST /admin/drain`, `DELETE /admin/drain` | `set_draining(true)` / `set_draining(false)` on every participant |
+| SIGTERM / SIGINT | `set_draining(true)` on every participant, then the exit is held while SIP transactions, B2BUA calls and the sum of `outstanding()` are above zero |
+| `server.drain_secs` expires | the calls still up are ended as before, then `force()` is called once on every participant and the process exits. With `drain_secs: 0` the participants are told and forced at once |
+
+The callbacks are plain Rust and are called from async tasks: return promptly,
+never block, and never attach to the Python interpreter from them. Read an
+atomic or take a short lock, and do anything slower on a task of your own. Keep
+the `ready()` reason short and free of secrets, since the probe returns it.
+
+Size the container runtime's stop timeout to cover `drain_secs` plus
+`teardown_secs`, as for any drain.
+
+## Rust addons: Diameter
+
+The Diameter manager the Python `diameter` namespace uses is reachable from Rust
+too, through `siphon::diameter::global_manager()`. It returns `None` when no
+`diameter:` block is configured, and is set before any task registered with
+`register_task` runs, so a task can fetch it straight away. Like
+`siphon::ipsec::global_manager()`, it is a process-wide handle set once at
+startup, which keeps the addon free of any plumbing through the builder.
+
+```rust
+use siphon::config::DiameterApplication;
+use siphon::SiphonServer;
+
+SiphonServer::builder()
+    .config_path("siphon.yaml")
+    .register_task(|script| {
+        script.tokio_handle().spawn(async move {
+            let Some(manager) = siphon::diameter::global_manager() else { return };
+            // The configured `diameter.routes[]` pick the peer.
+            if let Some(client) = manager.route_client(&DiameterApplication::Zh, None) {
+                // client.send_zh_mar(..).await, client.send_mar(..).await, ...
+            }
+        });
+    })
+    .run();
+```
+
+`route_client` honours the routing table and skips peers that are down. The
+calls on `DiameterClient` are async and Rust-only; they never attach to the
+Python interpreter.
+
 ## Testing extension scripts
 
 The [`siphon-sip` SDK](https://pypi.org/project/siphon-sip/) (`pip install

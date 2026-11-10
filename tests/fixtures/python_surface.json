@@ -699,6 +699,10 @@
       "addr": {
         "kind": "getset_descriptor"
       },
+      "host": {
+        "doc": "The Origin-Host the peer gave in its CER or CEA: the identity of the",
+        "kind": "getset_descriptor"
+      },
       "name": {
         "kind": "getset_descriptor"
       },
@@ -802,6 +806,11 @@
         "kind": "method_descriptor",
         "sig": "($self)"
       },
+      "peer_for_host": {
+        "doc": "The directly connected peer whose Origin-Host is `host`, for",
+        "kind": "method_descriptor",
+        "sig": "($self, host, tenant=None)"
+      },
       "peer_pool": {
         "doc": "Build a backend peer pool for `target` (a peer name or list of names)",
         "kind": "method_descriptor",
@@ -900,6 +909,11 @@
         "doc": "Originate a Diameter request by spec name + application name +",
         "kind": "method_descriptor",
         "sig": "($self, command, application, peer=None, timeout_ms=10000, **avps)"
+      },
+      "set_overload": {
+        "doc": "Report overload (RFC 7683): ask the nodes that send this one requests",
+        "kind": "method_descriptor",
+        "sig": "($self, reduction_percentage, validity_secs=None)"
       },
       "sgd_tfr": {
         "doc": "Send an SGd MT-Forward-Short-Message request to the served node",
@@ -1538,6 +1552,11 @@
       }
     },
     "PresenceNamespace": {
+      "claim_notification": {
+        "doc": "Claim the right to send one notification on a subscription.",
+        "kind": "method_descriptor",
+        "sig": "($self, subscription_id, change_id)"
+      },
       "document_count": {
         "doc": "Get the total number of entities with published documents.",
         "kind": "method_descriptor",

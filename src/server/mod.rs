@@ -11,11 +11,14 @@ pub(crate) mod shutdown_sequence;
 use shutdown_sequence::run_shutdown_sequence;
 mod event_clock;
 mod sbi_callbacks;
+mod sbi_notif_tls;
 
 #[cfg(test)]
 mod event_clock_tests;
 #[cfg(test)]
 mod sbi_callbacks_tests;
+#[cfg(test)]
+mod sbi_notif_tls_tests;
 #[cfg(test)]
 mod tests;
 
@@ -87,6 +90,7 @@ pub struct SiphonServer {
     module_extensions: Vec<(String, ModuleExtension)>,
     extension_tasks: Vec<ExtensionTask>,
     control_adapters: Vec<ControlAdapterHandle>,
+    lifecycle_participants: Vec<Arc<dyn crate::lifecycle::LifecycleParticipant>>,
 }
 
 impl SiphonServer {
@@ -104,6 +108,7 @@ impl SiphonServer {
             module_extensions: Vec::new(),
             extension_tasks: Vec::new(),
             control_adapters: Vec::new(),
+            lifecycle_participants: Vec::new(),
         }
     }
 
@@ -296,6 +301,41 @@ impl SiphonServer {
         self
     }
 
+    /// Register a component that takes part in readiness, drain and shutdown.
+    ///
+    /// For a Rust addon that owns long-lived state siphon cannot see (sessions
+    /// over its own protocol, its own sockets, an upstream peer). May be called
+    /// several times. See [`LifecycleParticipant`](crate::LifecycleParticipant)
+    /// for the contract: `/admin/ready` reports 503 with the participant's
+    /// reason while it is not ready, `/admin/drain` and SIGTERM call
+    /// `set_draining`, the shutdown waits while `outstanding()` is above zero,
+    /// and `force()` runs when `server.drain_secs` expires. With none
+    /// registered, behaviour is unchanged.
+    ///
+    /// # Examples
+    ///
+    /// ```ignore
+    /// use std::sync::Arc;
+    /// use siphon::SiphonServer;
+    ///
+    /// SiphonServer::builder()
+    ///     .config_path("siphon.yaml")
+    ///     .register_lifecycle(Arc::new(MySessions::new()))
+    ///     .run();
+    /// ```
+    pub fn register_lifecycle(
+        mut self,
+        participant: Arc<dyn crate::lifecycle::LifecycleParticipant>,
+    ) -> Self {
+        self.lifecycle_participants.push(participant);
+        self
+    }
+
+    /// Number of lifecycle participants currently registered on the builder.
+    pub fn lifecycle_participant_count(&self) -> usize {
+        self.lifecycle_participants.len()
+    }
+
     /// Number of extension tasks currently registered on the builder.
     /// Exposed primarily for tests and host applications that want to
     /// log how many tasks they've wired up before `.run()`.
@@ -385,6 +425,28 @@ impl SiphonServer {
             });
             (Arc::new(config), Some((path.to_owned(), document)))
         };
+        // Validate SBI TLS and bearer authentication before starting listeners or background tasks. Read
+        // files once and retain the material for timeout-specific clients.
+        let sbi_clients = config.sbi.as_ref().map(|sbi| {
+            let result = (|| -> Result<_, String> {
+                let manager = crate::sbi::SbiManager::new(sbi.to_sbi_config())?;
+                let bsf_http = sbi
+                    .bsf_url
+                    .as_ref()
+                    .map(|_| {
+                        manager.client_with_timeout(std::time::Duration::from_millis(
+                            sbi.bsf_timeout_ms
+                                .unwrap_or(sbi.timeout_secs.saturating_mul(1000)),
+                        ))
+                    })
+                    .transpose()?;
+                Ok((manager, bsf_http))
+            })();
+            result.unwrap_or_else(|error| {
+                eprintln!("Failed to initialize SBI client: {error}");
+                std::process::exit(1);
+            })
+        });
         // One `Server` / `User-Agent` pair shared by the dispatcher, the UAC
         // and the registrant; `POST /admin/config/reload` swaps it.
         let identity = crate::config::IdentityHeaders::resolve(
@@ -616,6 +678,7 @@ impl SiphonServer {
 
         // Wire Diameter manager into PyAuth for IMS digest
         if let Some(ref manager) = diameter_manager {
+            crate::diameter::set_global_manager(Arc::clone(manager));
             pyo3::Python::attach(|python| {
                 crate::script::api::wire_auth_diameter_manager(python, Arc::clone(manager));
                 info!("Diameter manager wired into auth namespace for IMS digest");
@@ -904,8 +967,16 @@ impl SiphonServer {
                 // The P-CSCF side of the SA selectors, per family (a dual-stack
                 // P-CSCF needs both, 3GPP TS 33.203): a concrete UDP bind, never a
                 // wildcard, which would program SAs that match no packet.
+                let protected_ports: Vec<u16> = ipsec_config
+                    .pcscf_port_c
+                    .as_slice()
+                    .iter()
+                    .copied()
+                    .chain(std::iter::once(ipsec_config.pcscf_port_s))
+                    .collect();
                 let (pcscf_addr_v4, pcscf_addr_v6) = crate::ipsec::runtime::pcscf_sa_addresses(
                     config.listen.udp.iter().map(|entry| entry.address()),
+                    &protected_ports,
                 );
 
                 let ipsec_manager_for_singleton = Arc::clone(&manager);
@@ -2262,77 +2333,13 @@ impl SiphonServer {
                 for peer_entry in &diameter_config.peers {
                     let peer_config =
                         diameter_config.to_peer_config(peer_entry, product_name, product_version);
-                    let peer_name = peer_entry.name.clone();
-                    let manager_for_task = Arc::clone(manager);
-                    let tx = diameter_incoming_tx.clone();
-                    let reconnect_delay = peer_config.reconnect_delay;
-
-                    // Publish the peer as down before the first connect attempt.
-                    // The reconnect task below only registers a client *after* a
-                    // successful connect, so without this a peer that has never
-                    // come up would be absent from the gauge rather than
-                    // reported down — the failure most worth seeing.
-                    crate::metrics::set_diameter_peer_up(&peer_name, false);
-
-                    // Spawn a persistent reconnect task per peer — reconnects
-                    // when the connection drops (watchdog failure, TCP reset, etc.)
-                    // and re-registers the client in the DiameterManager.
-                    tokio::spawn(async move {
-                        loop {
-                            match crate::diameter::peer::connect(peer_config.clone()).await {
-                                Ok((peer, mut incoming_rx)) => {
-                                    let client = Arc::new(crate::diameter::DiameterClient::new(
-                                        Arc::clone(&peer),
-                                    ));
-                                    manager_for_task.register(peer_name.clone(), client);
-                                    crate::metrics::set_diameter_peer_up(&peer_name, true);
-                                    info!(peer = %peer_name, "Diameter peer connected");
-
-                                    // Forward incoming requests until the peer disconnects.
-                                    //
-                                    // The awaiting send is deliberate, and is the one
-                                    // shape of it that is correct: this task does nothing
-                                    // else, holds no lock, no handler thread and no read
-                                    // loop, so parking it on a full dispatch queue is
-                                    // backpressure rather than a stall. It resumes in
-                                    // order when capacity frees, losing nothing.
-                                    //
-                                    // What must not happen is that backpressure reaching
-                                    // the peer's *reader* task, which is also what
-                                    // correlates answers — that would fail every
-                                    // in-flight request on the peer at once. It cannot:
-                                    // the reader sheds into `incoming_rx` rather than
-                                    // awaiting it, so a wedged dispatcher degrades to
-                                    // dropped inbound requests (the peer retries) and
-                                    // never to a stalled connection.
-                                    let tx_inner = tx.clone();
-                                    let peer_for_forward = Arc::clone(&peer);
-                                    while let Some(request) = incoming_rx.recv().await {
-                                        if tx_inner
-                                            .send((request, Arc::clone(&peer_for_forward)))
-                                            .await
-                                            .is_err()
-                                        {
-                                            break;
-                                        }
-                                    }
-
-                                    // incoming_rx closed — peer disconnected
-                                    crate::metrics::set_diameter_peer_up(&peer_name, false);
-                                    warn!(peer = %peer_name, "Diameter peer disconnected, reconnecting");
-                                }
-                                Err(error) => {
-                                    crate::metrics::set_diameter_peer_up(&peer_name, false);
-                                    warn!(
-                                        peer = %peer_name, %error,
-                                        "Diameter connection failed, retrying in {reconnect_delay}s",
-                                    );
-                                }
-                            }
-                            tokio::time::sleep(std::time::Duration::from_secs(reconnect_delay))
-                                .await;
-                        }
-                    });
+                    crate::diameter::group::spawn_client(
+                        peer_entry,
+                        peer_config,
+                        diameter_config.resolve_interval,
+                        Arc::clone(manager),
+                        diameter_incoming_tx.clone(),
+                    );
                 }
             }
         }
@@ -2386,9 +2393,7 @@ impl SiphonServer {
         // into the dispatcher below.
 
         // --- SBI client ---
-        if let Some(ref sbi_config) = config.sbi {
-            let sbi_internal_config = sbi_config.to_sbi_config();
-            let _sbi_manager = crate::sbi::SbiManager::new(sbi_internal_config);
+        if let (Some(sbi_config), Some((sbi_manager, bsf_http))) = (&config.sbi, sbi_clients) {
             info!("SBI client initialized");
             if let Some(ref nrf_url) = sbi_config.nrf_url {
                 info!(nrf_url = %nrf_url, "NRF discovery endpoint configured");
@@ -2403,34 +2408,25 @@ impl SiphonServer {
                 );
                 let requester_nf_type = sbi_config.requester_nf_type.as_deref().unwrap_or("AF");
 
-                let http_client = reqwest::Client::builder()
-                    .timeout(std::time::Duration::from_secs(sbi_config.timeout_secs))
-                    .build()
-                    .unwrap_or_default();
+                let http_client = sbi_manager.client().clone();
                 let npcf_client = std::sync::Arc::new(
                     crate::sbi::npcf::NpcfClient::new(npcf_url, http_client)
                         .with_communication(communication),
                 );
 
-                // Optional Nbsf_Management (BSF) discovery client. Its own
-                // reqwest client carries the BSF-specific timeout
-                // (bsf_timeout_ms, falling back to timeout_secs).
-                let bsf_client = sbi_config.bsf_url.as_ref().map(|bsf_url| {
-                    let bsf_timeout = std::time::Duration::from_millis(
-                        sbi_config
-                            .bsf_timeout_ms
-                            .unwrap_or(sbi_config.timeout_secs.saturating_mul(1000)),
-                    );
-                    let bsf_http = reqwest::Client::builder()
-                        .timeout(bsf_timeout)
-                        .build()
-                        .unwrap_or_default();
-                    std::sync::Arc::new(
-                        crate::sbi::nbsf::BsfClient::new(bsf_url, bsf_http)
-                            .with_communication(communication)
-                            .with_requester_nf_type(requester_nf_type),
-                    )
-                });
+                // The BSF timeout override uses the same startup-loaded TLS material.
+                let bsf_client =
+                    sbi_config
+                        .bsf_url
+                        .as_ref()
+                        .zip(bsf_http)
+                        .map(|(bsf_url, http)| {
+                            std::sync::Arc::new(
+                                crate::sbi::nbsf::BsfClient::new(bsf_url, http)
+                                    .with_communication(communication)
+                                    .with_requester_nf_type(requester_nf_type),
+                            )
+                        });
                 let pcf_scheme = crate::sbi::nbsf::Scheme::from_config_str(
                     sbi_config.pcf_scheme.as_deref().unwrap_or("http"),
                 );
@@ -2459,16 +2455,9 @@ impl SiphonServer {
 
             // N5 callback listener: TS 29.514 eventNotification and
             // terminationRequest (see server::sbi_callbacks).
-            if let Some(ref notif_listen) = sbi_config.notif_listen {
-                let notif_addr: std::net::SocketAddr =
-                    notif_listen.parse().unwrap_or_else(|error| {
-                        eprintln!(
-                            "Invalid sbi.notif_listen address '{}': {error}",
-                            notif_listen
-                        );
-                        std::process::exit(1);
-                    });
-                sbi_callbacks::spawn_listener(notif_addr, engine.state_arc());
+            if let Err(error) = sbi_callbacks::spawn_listener(sbi_config, engine.state_arc()) {
+                eprintln!("{error}");
+                std::process::exit(1);
             }
         }
 
@@ -2521,6 +2510,9 @@ impl SiphonServer {
 
         // --- Start dispatcher ---
         let drain = Arc::new(dispatcher::DrainState::new());
+        for participant in std::mem::take(&mut self.lifecycle_participants) {
+            drain.participants.register(participant);
+        }
 
         // --- HTTP admin API (health/readiness probes + registration inspection) ---
         let config_reloader = config_document.map(|(path, document)| {

@@ -16,10 +16,14 @@
 //! block for the backend round-trip, so serial dispatch would head-of-line-block
 //! every tenant.
 
+mod backend;
+#[cfg(test)]
+use backend::spawn_backend_connection;
+
 use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::Instant;
 
 use pyo3::prelude::*;
 use tokio::sync::{mpsc, Semaphore};
@@ -135,14 +139,17 @@ pub fn spawn(
             );
         }
         for server in &tenant.servers {
-            spawn_backend_connection(
+            backend::spawn(
                 tenant_name,
                 tenant,
                 server,
                 Arc::clone(&manager),
+                Arc::clone(&engine),
+                Arc::clone(&semaphore),
                 Arc::clone(&applications),
                 product_name,
                 product_version,
+                config.resolve_interval,
             );
         }
         for upstream in &tenant.connect_to {
@@ -302,57 +309,6 @@ fn warn_if_sctp_without_feature(config: &DiameterConfig) {
 #[cfg(feature = "sctp")]
 fn warn_if_sctp_without_feature(_config: &DiameterConfig) {}
 
-/// Connect one backend server as an outbound client, reconnecting on drop.
-/// Supports both TCP and SCTP transports.
-fn spawn_backend_connection(
-    tenant_name: &str,
-    tenant: &crate::config::DiameterTenant,
-    server: &crate::config::DiameterServerEntry,
-    manager: Arc<DiameterManager>,
-    applications: TenantApplications,
-    product_name: &str,
-    product_version: &str,
-) {
-    let transport = server.transport.clone();
-    let mut config = PeerConfig {
-        host: server.host.clone(),
-        port: server.port,
-        origin_host: tenant.identity.origin_host.clone(),
-        origin_realm: tenant.identity.origin_realm.clone(),
-        destination_host: None,
-        destination_realm: tenant.identity.origin_realm.clone(),
-        local_ip: std::net::Ipv4Addr::UNSPECIFIED,
-        application_ids: vec![],
-        watchdog_interval: 30,
-        reconnect_delay: 5,
-        product_name: product_name.to_string(),
-        firmware_revision: peer::version_to_firmware_revision(product_version),
-    };
-    let name = server.name.clone();
-    let tenant_name = tenant_name.to_string();
-    tokio::spawn(async move {
-        loop {
-            // Asked per attempt: the CER advertises what the script serves now.
-            config.application_ids = applications(&tenant_name);
-            match peer::connect_with_transport(config.clone(), &transport).await {
-                Ok((connected, mut incoming_rx)) => {
-                    let client = Arc::new(DiameterClient::new(Arc::clone(&connected)));
-                    manager.register_backend(&tenant_name, &name, client);
-                    info!(peer = %name, tenant = %tenant_name, "Diameter server backend connected");
-                    // Drain backend-initiated requests (none expected for a
-                    // pure relay target); answers correlate via send_request.
-                    while incoming_rx.recv().await.is_some() {}
-                    warn!(peer = %name, "Diameter server backend disconnected, reconnecting");
-                }
-                Err(error) => {
-                    warn!(peer = %name, %error, "Diameter server backend connect failed, retrying in 5s");
-                }
-            }
-            tokio::time::sleep(Duration::from_secs(5)).await;
-        }
-    });
-}
-
 /// Dial an outbound connection and **serve** the inbound requests it carries
 /// via `@diameter.on_request` — the HSS-dials-Diameter server case. siphon sends the CER
 /// with the tenant identity; reconnects on drop. Per-request dispatch is
@@ -378,62 +334,69 @@ fn spawn_serving_connection(
         destination_realm: origin_realm.clone(),
         local_ip: std::net::Ipv4Addr::UNSPECIFIED,
         application_ids: vec![],
-        watchdog_interval: 30,
-        reconnect_delay: 5,
+        watchdog_interval: entry.watchdog_interval.unwrap_or(30),
+        reconnect_delay: entry.reconnect_delay.unwrap_or(5),
+        source_address: entry.source_address,
+        lifecycle: entry.lifecycle(),
         product_name: product_name.to_string(),
         firmware_revision: peer::version_to_firmware_revision(product_version),
     };
+    let mut schedule = crate::diameter::backoff::ReconnectSchedule::new(
+        config.reconnect_delay,
+        config.lifecycle.reconnect_delay_max,
+    );
     let transport = entry.transport.clone();
     let peer_info = PyInboundPeer {
         name: entry.name.clone(),
         tenant: tenant_name.clone(),
         addr: format!("{}:{}", entry.host, entry.port),
         transport: transport.clone(),
+        // The peer's CER/CEA identity, once connected (`serve_requests`).
+        host: String::new(),
     };
 
     tokio::spawn(async move {
         loop {
+            let delay;
             // Asked per attempt: the CER advertises what the script serves now.
             config.application_ids = applications(&tenant_name);
             match peer::connect_with_transport(config.clone(), &transport).await {
-                Ok((connected, mut incoming_rx)) => {
+                Ok((connected, incoming_rx)) => {
+                    if schedule.connected() {
+                        connected.enter_reopen().await;
+                    }
                     info!(
                         peer = %entry.name,
                         tenant = %tenant_name,
                         "Diameter server: outbound serving connection established (inbound requests → on_request)"
                     );
-                    let mut serving = ServingConnection::new(&tenant_name, &entry.name, &connected);
-                    while let Some(incoming) = incoming_rx.recv().await {
-                        serving.observe(&incoming.avps);
-                        let engine = Arc::clone(&engine);
-                        let semaphore = Arc::clone(&semaphore);
-                        let inbound_peer = Arc::clone(&connected);
-                        let peer_info = peer_info.clone();
-                        let origin_host = origin_host.clone();
-                        let origin_realm = origin_realm.clone();
-                        tokio::spawn(async move {
-                            let _permit = match semaphore.acquire_owned().await {
-                                Ok(permit) => permit,
-                                Err(_) => return,
-                            };
-                            dispatch_request(
-                                engine,
-                                inbound_peer,
-                                incoming,
-                                peer_info,
-                                origin_host,
-                                origin_realm,
-                            )
-                            .await;
-                        });
+                    let ended = Arc::clone(&connected);
+                    serve_requests(
+                        connected,
+                        incoming_rx,
+                        peer_info.clone(),
+                        Arc::clone(&engine),
+                        Arc::clone(&semaphore),
+                        (origin_host.clone(), origin_realm.clone()),
+                    )
+                    .await;
+                    match schedule.ended(&ended) {
+                        None => {
+                            info!(peer = %entry.name, "Diameter server: outbound serving connection disconnected by this node, not reconnecting");
+                            return;
+                        }
+                        Some(wait) => {
+                            warn!(peer = %entry.name, wait_secs = wait.as_secs(), "Diameter server: outbound serving connection dropped, reconnecting");
+                            delay = wait;
+                        }
                     }
-                    warn!(peer = %entry.name, "Diameter server: outbound serving connection dropped, reconnecting");
                 }
                 Err(error) => {
-                    warn!(peer = %entry.name, %error, "Diameter server: outbound serving connect failed, retrying in 5s");
+                    delay = schedule.failed();
+                    warn!(peer = %entry.name, %error, wait_secs = delay.as_secs(), "Diameter server: outbound serving connect failed, retrying");
                 }
             }
-            tokio::time::sleep(Duration::from_secs(5)).await;
+            tokio::time::sleep(delay).await;
         }
     });
 }
@@ -511,7 +474,7 @@ async fn serve_connection(
     semaphore: Arc<Semaphore>,
     identities: TenantIdentities,
 ) {
-    let (incoming_tx, mut incoming_rx) = mpsc::channel::<IncomingRequest>(256);
+    let (incoming_tx, incoming_rx) = mpsc::channel::<IncomingRequest>(256);
 
     // The CER identity resolver: invoke @on_inbound_cer, else the tenant's
     // configured identity.
@@ -566,19 +529,48 @@ async fn serve_connection(
         tenant: acl_match.tenant.clone(),
         addr: peer_addr.to_string(),
         transport: transport.to_string(),
+        host: String::new(),
     };
 
-    // Lets `diameter.reauthorize` reach the clients behind this connection;
-    // dropped (entries removed) when the connection ends.
-    let mut serving = ServingConnection::new(&peer_info.tenant, &peer_info.name, &admitted_peer);
+    serve_requests(
+        admitted_peer,
+        incoming_rx,
+        peer_info,
+        engine,
+        semaphore,
+        (local_origin_host, local_origin_realm),
+    )
+    .await;
+}
+
+/// Serve the requests the other end sends on one open connection, whichever
+/// side dialled it, until the connection ends: each goes to
+/// `@diameter.on_request`, bounded by `semaphore`. For as long as it runs the
+/// connection is listed by the Origin-Host the peer gave in its CER or CEA
+/// (`diameter.peer_for_host`), and by the hosts its requests carry
+/// (`diameter.reauthorize`, `diameter.originate`).
+async fn serve_requests(
+    connected: Arc<DiameterPeer>,
+    mut incoming_rx: mpsc::Receiver<IncomingRequest>,
+    peer_info: PyInboundPeer,
+    engine: Arc<ScriptEngine>,
+    semaphore: Arc<Semaphore>,
+    local_identity: (String, String),
+) {
+    let mut peer_info = peer_info;
+    peer_info.host = connected
+        .remote_origin_host()
+        .unwrap_or_default()
+        .to_owned();
+    let _listing = crate::diameter::directory::list(&peer_info.tenant, &peer_info.name, &connected);
+    let mut serving = ServingConnection::new(&peer_info.tenant, &peer_info.name, &connected);
     while let Some(incoming) = incoming_rx.recv().await {
         serving.observe(&incoming.avps);
         let engine = Arc::clone(&engine);
         let semaphore = Arc::clone(&semaphore);
-        let inbound_peer = Arc::clone(&admitted_peer);
+        let inbound_peer = Arc::clone(&connected);
         let peer_info = peer_info.clone();
-        let local_origin_host = local_origin_host.clone();
-        let local_origin_realm = local_origin_realm.clone();
+        let (local_origin_host, local_origin_realm) = local_identity.clone();
         tokio::spawn(async move {
             let _permit = match semaphore.acquire_owned().await {
                 Ok(permit) => permit,
@@ -693,8 +685,12 @@ pub(crate) async fn dispatch_request(
         return;
     }
     let start = Instant::now();
+    // Counted while it is served: the pending-request depth a reporting node
+    // derives its overload from.
+    let _serving = crate::diameter::overload::track_inflight();
     // Captured before `incoming` moves into the handler closure below.
     let command_code = incoming.command_code;
+    let request_features = crate::diameter::overload::request_features(&incoming.raw);
 
     // Build the answer (and keep the Py request/answer for the completed hook)
     // on the Python executor. An `async def` handler that awaits — at any of
@@ -778,7 +774,9 @@ pub(crate) async fn dispatch_request(
     // separately rather than a reason to lose the transaction.
     let result_label = emitted_answer_result_label(&outcome.wire);
 
-    if let Err(error) = inbound_peer.send_response(outcome.wire).await {
+    // The overload this node reports, to a requester that advertised DOIC.
+    let wire = crate::diameter::overload::annotate_answer(request_features, outcome.wire);
+    if let Err(error) = inbound_peer.send_response(wire).await {
         warn!(%error, "Diameter server: failed to send answer upstream");
     }
 
@@ -1777,6 +1775,7 @@ mod handler_failure_tests {
             tenant: "default".to_string(),
             addr: "192.0.2.10:3868".to_string(),
             transport: "tcp".to_string(),
+            host: String::new(),
         }
     }
 
@@ -2177,6 +2176,7 @@ pub(crate) mod zn_serving_tests {
             tenant: "default".to_string(),
             addr: "192.0.2.20:3868".to_string(),
             transport: "tcp".to_string(),
+            host: String::new(),
         };
         Python::attach(|python| {
             build_answer_via_handler(
@@ -2351,6 +2351,7 @@ mod s13_serving_tests {
             tenant: "default".to_string(),
             addr: "192.0.2.30:3868".to_string(),
             transport: "tcp".to_string(),
+            host: String::new(),
         };
         Python::attach(|python| {
             build_answer_via_handler(
@@ -2514,6 +2515,8 @@ mod s13_serving_tests {
             application_ids: vec![(dictionary::VENDOR_3GPP, dictionary::S13_APP_ID)],
             watchdog_interval: 3600,
             reconnect_delay: 5,
+            source_address: None,
+            lifecycle: Default::default(),
             product_name: "SIPhon".to_string(),
             firmware_revision: 1,
         };
@@ -2538,6 +2541,7 @@ mod s13_serving_tests {
 #[cfg(test)]
 mod awaiting_handler_tests {
     use super::*;
+    use std::time::Duration;
 
     /// The registry calls `@diameter.on_request` and friends make once
     /// `diameter:` is configured, which an embedded test script is not.
@@ -2598,6 +2602,8 @@ mod awaiting_handler_tests {
             application_ids: vec![],
             watchdog_interval: 30,
             reconnect_delay: 5,
+            source_address: None,
+            lifecycle: Default::default(),
             product_name: "SIPhon".to_string(),
             firmware_revision: 100,
         }
@@ -2644,6 +2650,7 @@ mod awaiting_handler_tests {
                         tenant: "default".to_string(),
                         addr: "192.0.2.10:3868".to_string(),
                         transport: "tcp".to_string(),
+                        host: String::new(),
                     },
                     "siphon.example.net".to_string(),
                     "example.net".to_string(),
@@ -2683,6 +2690,393 @@ mod awaiting_handler_tests {
                 requests,
                 "the awaiting on_request_completed hook ran for every request"
             );
+        });
+    }
+}
+
+#[cfg(test)]
+mod backend_connection_tests {
+    use super::*;
+    use crate::config::{DiameterServerEntry, DiameterTenant, DiameterTenantIdentity};
+    use crate::diameter::codec::Avp;
+    use std::time::Duration;
+
+    const SCRIPT: &str = concat!(
+        "import _siphon_registry\n",
+        "\n",
+        "def handle(request):\n",
+        "    return request.answer(2001)\n",
+        "\n",
+        "_siphon_registry.register('diameter.on_request', None, handle, False)\n",
+    );
+
+    const CANCEL_LOCATION: u32 = 317;
+    const S6A: u32 = 16_777_251;
+
+    fn far_config() -> PeerConfig {
+        PeerConfig {
+            host: "127.0.0.1".to_string(),
+            port: 0,
+            origin_host: "hss-1.epc.example.net".to_string(),
+            origin_realm: "epc.example.net".to_string(),
+            destination_host: None,
+            destination_realm: "epc.example.net".to_string(),
+            local_ip: "127.0.0.1".parse().expect("a literal address"),
+            application_ids: vec![(10_415, S6A)],
+            watchdog_interval: 30,
+            reconnect_delay: 5,
+            source_address: None,
+            lifecycle: Default::default(),
+            product_name: "far".to_string(),
+            firmware_revision: 1,
+        }
+    }
+
+    /// A Cancel-Location-Request the backend sends toward an MME.
+    fn cancel_location(hop_by_hop: u32) -> Vec<u8> {
+        DiameterMsg {
+            flags: crate::diameter::codec::FLAG_REQUEST | crate::diameter::codec::FLAG_PROXIABLE,
+            command_code: CANCEL_LOCATION,
+            application_id: S6A,
+            hop_by_hop,
+            end_to_end: 0x5151,
+            avps: vec![
+                Avp::utf8(dictionary::avp::SESSION_ID, 0, "hss-1.epc.example.net;1;1"),
+                Avp::utf8(dictionary::avp::ORIGIN_HOST, 0, "hss-1.epc.example.net"),
+                Avp::utf8(dictionary::avp::ORIGIN_REALM, 0, "epc.example.net"),
+                Avp::utf8(
+                    dictionary::avp::DESTINATION_HOST,
+                    0,
+                    "mme-1.epc.example.net",
+                ),
+                Avp::utf8(dictionary::avp::DESTINATION_REALM, 0, "epc.example.net"),
+                Avp::utf8(dictionary::avp::USER_NAME, 0, "001010000000001"),
+            ],
+        }
+        .to_wire()
+    }
+
+    /// A relay that sends a request to the directly connected peer its
+    /// Destination-Host names (RFC 6733 section 6.1.6).
+    const RELAY_SCRIPT: &str = concat!(
+        "from siphon import diameter\n",
+        "\n",
+        "@diameter.on_request\n",
+        "async def handle(request):\n",
+        "    peer = diameter.peer_for_host(request.dest_host, tenant=request.peer.tenant)\n",
+        "    if peer is None:\n",
+        "        return request.reject(3002)\n",
+        "    return await request.forward_to(peer, timeout_secs=1.0)\n",
+    );
+
+    fn peer_config(origin_host: &str) -> PeerConfig {
+        PeerConfig {
+            origin_host: origin_host.to_string(),
+            ..far_config()
+        }
+    }
+
+    /// Accept one connection on a loopback port and complete its capabilities
+    /// exchange as `origin_host`.
+    async fn far_end(
+        origin_host: &'static str,
+    ) -> (
+        u16,
+        tokio::task::JoinHandle<(Arc<DiameterPeer>, mpsc::Receiver<IncomingRequest>)>,
+    ) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("a loopback port");
+        let port = listener.local_addr().expect("bound").port();
+        let accepted = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.expect("the relay connects");
+            peer::accept(stream.into(), peer_config(origin_host))
+                .await
+                .expect("the capabilities exchange completes")
+        });
+        (port, accepted)
+    }
+
+    async fn listed(tenant: &str, host: &str) {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while crate::diameter::directory::find(tenant, host).is_none() {
+            assert!(Instant::now() < deadline, "{host} is never listed");
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    }
+
+    #[test]
+    fn a_request_for_a_directly_connected_host_is_relayed_to_that_peer() {
+        let _serial = crate::script::async_pool::pool_test_guard();
+        crate::script::async_pool::test_pools_runtime().block_on(async {
+            crate::script::async_pool::ensure_test_pools();
+            let engine = Arc::new(
+                ScriptEngine::new_embedded(RELAY_SCRIPT).expect("the test script compiles"),
+            );
+            // The Rust namespace a configured server injects, in this script
+            // only: the process-wide singleton would reach every other test.
+            Python::attach(|python| {
+                let namespace = Py::new(
+                    python,
+                    crate::script::api::diameter::PyDiameter::new(Arc::new(DiameterManager::new())),
+                )
+                .expect("the namespace is created");
+                let state = engine.state();
+                let handlers = state.handlers_for(&HandlerKind::DiameterOnRequest(None));
+                let handler = handlers.first().expect("the relay handler is registered");
+                handler
+                    .callable
+                    .bind(python)
+                    .getattr("__globals__")
+                    .and_then(|globals| globals.set_item("diameter", namespace))
+                    .expect("the script's globals take the namespace");
+            });
+            let tenant = DiameterTenant {
+                identity: DiameterTenantIdentity {
+                    origin_host: "dra-1.epc.example.net".to_string(),
+                    origin_realm: "epc.example.net".to_string(),
+                },
+                ..DiameterTenant::default()
+            };
+            let applications: TenantApplications = Arc::new(|_| vec![(10_415, S6A)]);
+            let semaphore = Arc::new(Semaphore::new(8));
+
+            // The HSS: a backend the relay dials.
+            let (hss_port, hss) = far_end("hss-1.epc.example.net").await;
+            spawn_backend_connection(
+                "t-relay",
+                &tenant,
+                &DiameterServerEntry {
+                    all_addresses: false,
+                    name: "hss".to_string(),
+                    host: "127.0.0.1".to_string(),
+                    port: hss_port,
+                    transport: "tcp".to_string(),
+                    ..Default::default()
+                },
+                Arc::new(DiameterManager::new()),
+                Arc::clone(&engine),
+                Arc::clone(&semaphore),
+                Arc::clone(&applications),
+                "SIPhon",
+                "1.0.0",
+            );
+            // The MME: a peer on a connection of its own, which answers.
+            let (mme_port, mme) = far_end("mme-1.epc.example.net").await;
+            spawn_serving_connection(
+                "t-relay".to_string(),
+                (
+                    "dra-1.epc.example.net".to_string(),
+                    "epc.example.net".to_string(),
+                ),
+                DiameterServerEntry {
+                    all_addresses: false,
+                    name: "mme".to_string(),
+                    host: "127.0.0.1".to_string(),
+                    port: mme_port,
+                    transport: "tcp".to_string(),
+                    ..Default::default()
+                },
+                Arc::clone(&engine),
+                Arc::clone(&semaphore),
+                Arc::clone(&applications),
+                "SIPhon",
+                "1.0.0",
+            );
+            let (hss_peer, _hss_incoming) = hss.await.expect("the HSS accepts");
+            let (mme_peer, mut mme_incoming) = mme.await.expect("the MME accepts");
+            let mme_answering = Arc::clone(&mme_peer);
+            let (route_records_tx, mut route_records) = mpsc::channel::<Vec<String>>(4);
+            tokio::spawn(async move {
+                while let Some(incoming) = mme_incoming.recv().await {
+                    let request = DiameterMsg::from_wire(&incoming.raw).expect("the CLR parses");
+                    let records = request
+                        .find_all(dictionary::avp::ROUTE_RECORD, 0)
+                        .filter_map(|record| record.as_str())
+                        .collect();
+                    let _ = route_records_tx.send(records).await;
+                    // One subscriber's requests are never answered.
+                    if request.get_str(dictionary::avp::USER_NAME).as_deref()
+                        == Some("001010000000002")
+                    {
+                        continue;
+                    }
+                    let answer = forward::build_answer(
+                        &request,
+                        "mme-1.epc.example.net",
+                        "epc.example.net",
+                        2001,
+                        None,
+                    );
+                    let _ = mme_answering.send_response(answer.to_wire()).await;
+                }
+            });
+            listed("t-relay", "hss-1.epc.example.net").await;
+            listed("t-relay", "mme-1.epc.example.net").await;
+
+            let answer = hss_peer
+                .send_request_timeout(
+                    cancel_location(0x7000_0000 + hss_peer.next_hbh()),
+                    Duration::from_secs(5),
+                )
+                .await
+                .expect("the relay answers");
+            let answer = DiameterMsg::from_wire(&answer.raw).expect("the answer parses");
+            assert_eq!(answer.answer_result_codes().0, Some(2001));
+            assert_eq!(
+                answer.get_str(dictionary::avp::ORIGIN_HOST).as_deref(),
+                Some("mme-1.epc.example.net"),
+                "the MME answered: the request reached the peer its Destination-Host names"
+            );
+            // RFC 6733 section 6.1.9: the identity of the peer the request
+            // was received from, which is the HSS, not the relay itself.
+            assert_eq!(
+                route_records.recv().await.expect("the MME saw the request"),
+                vec!["hss-1.epc.example.net".to_string()]
+            );
+
+            // The MME stays silent. The relay's 3004 must carry the HSS's own
+            // Hop-by-Hop Identifier, which is how the HSS matches it (RFC 6733
+            // section 6.2). The HSS's identifiers start at 0x7000_0000, apart
+            // from the relay's counter towards the MME, which also starts at 1.
+            let mut silent =
+                DiameterMsg::from_wire(&cancel_location(0x7000_0000 + hss_peer.next_hbh()))
+                    .expect("the CLR parses");
+            silent
+                .avps
+                .retain(|avp| avp.code != dictionary::avp::USER_NAME);
+            silent
+                .avps
+                .push(Avp::utf8(dictionary::avp::USER_NAME, 0, "001010000000002"));
+            let answer = hss_peer
+                .send_request_timeout(silent.to_wire(), Duration::from_secs(5))
+                .await
+                .expect("the relay's own answer reaches the HSS");
+            let answer = DiameterMsg::from_wire(&answer.raw).expect("the answer parses");
+            assert_eq!(answer.answer_result_codes().0, Some(3004));
+            route_records
+                .recv()
+                .await
+                .expect("the MME saw the second request");
+
+            // A host no connection has: the relay's own 3002.
+            let mut unknown =
+                DiameterMsg::from_wire(&cancel_location(0x7000_0000 + hss_peer.next_hbh()))
+                    .expect("the CLR parses");
+            unknown
+                .avps
+                .retain(|avp| avp.code != dictionary::avp::DESTINATION_HOST);
+            unknown.avps.push(Avp::utf8(
+                dictionary::avp::DESTINATION_HOST,
+                0,
+                "mme-9.epc.example.net",
+            ));
+            let answer = hss_peer
+                .send_request_timeout(unknown.to_wire(), Duration::from_secs(5))
+                .await
+                .expect("the relay answers");
+            let answer = DiameterMsg::from_wire(&answer.raw).expect("the answer parses");
+            assert_eq!(answer.answer_result_codes().0, Some(3002));
+            mme_peer.shutdown();
+            hss_peer.shutdown();
+        });
+    }
+
+    // A plain test that blocks on the pools' runtime, as the other dispatch
+    // tests do: the serialising guard is a std mutex.
+    #[test]
+    fn a_request_a_backend_sends_on_its_connection_is_served_and_the_backend_is_listed() {
+        let _serial = crate::script::async_pool::pool_test_guard();
+        crate::script::async_pool::test_pools_runtime().block_on(async {
+            crate::script::async_pool::ensure_test_pools();
+            let engine =
+                Arc::new(ScriptEngine::new_embedded(SCRIPT).expect("the test script compiles"));
+
+            // The backend: accepts the relay's connection and answers its CER.
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+                .await
+                .expect("a loopback port");
+            let port = listener.local_addr().expect("bound").port();
+            let backend = tokio::spawn(async move {
+                let (stream, _) = listener.accept().await.expect("the relay connects");
+                peer::accept(stream.into(), far_config())
+                    .await
+                    .expect("the capabilities exchange completes")
+            });
+
+            let tenant = DiameterTenant {
+                identity: DiameterTenantIdentity {
+                    origin_host: "dra-0.epc.example.net".to_string(),
+                    origin_realm: "epc.example.net".to_string(),
+                },
+                ..DiameterTenant::default()
+            };
+            let server = DiameterServerEntry {
+                all_addresses: false,
+                name: "hss".to_string(),
+                host: "127.0.0.1".to_string(),
+                port,
+                transport: "tcp".to_string(),
+                ..Default::default()
+            };
+            let applications: TenantApplications = Arc::new(|_| vec![(10_415, S6A)]);
+            spawn_backend_connection(
+                "t-backend",
+                &tenant,
+                &server,
+                Arc::new(DiameterManager::new()),
+                Arc::clone(&engine),
+                Arc::new(Semaphore::new(8)),
+                applications,
+                "SIPhon",
+                "1.0.0",
+            );
+
+            let (backend_peer, _backend_incoming) =
+                tokio::time::timeout(Duration::from_secs(5), backend)
+                    .await
+                    .expect("the relay dials its backend")
+                    .expect("the backend task completes");
+            assert_eq!(
+                backend_peer.remote_origin_host(),
+                Some("dra-0.epc.example.net"),
+                "an accepted connection records the CER's Origin-Host"
+            );
+
+            // Listed by the CEA's Origin-Host once the connection is open.
+            let deadline = Instant::now() + Duration::from_secs(5);
+            let listed = loop {
+                if let Some(found) =
+                    crate::diameter::directory::find("t-backend", "HSS-1.epc.example.net")
+                {
+                    break found;
+                }
+                assert!(Instant::now() < deadline, "the backend is never listed");
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            };
+            assert_eq!(listed.0, "hss");
+            assert_eq!(listed.1.remote_origin_realm(), Some("epc.example.net"));
+
+            // RFC 6733 lets either end send requests: the backend's own
+            // request is served, not dropped.
+            let answer = backend_peer
+                .send_request_timeout(
+                    cancel_location(backend_peer.next_hbh()),
+                    Duration::from_secs(5),
+                )
+                .await
+                .expect("the relay answers a request its backend sends");
+            let answer = DiameterMsg::from_wire(&answer.raw).expect("the answer parses");
+            assert_eq!(answer.command_code, CANCEL_LOCATION);
+            assert_eq!(answer.answer_result_codes().0, Some(2001));
+
+            // Gone from the directory once the backend closes the connection.
+            backend_peer.shutdown();
+            let deadline = Instant::now() + Duration::from_secs(5);
+            while crate::diameter::directory::find("t-backend", "hss-1.epc.example.net").is_some() {
+                assert!(Instant::now() < deadline, "a closed backend stays listed");
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
         });
     }
 }

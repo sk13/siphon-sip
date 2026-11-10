@@ -326,6 +326,14 @@ fn default_ifc_key_prefix() -> String {
 /// Top-level `sbi:` configuration for 5G Service-Based Interface.
 #[derive(Debug, Deserialize, Clone)]
 pub struct SbiYamlConfig {
+    /// Static bearer credential file (environment expansion supported).
+    pub bearer_token_file: Option<String>,
+    /// The header the bearer token is sent in: `authorization` (default) or
+    /// `proxy-authorization` (a token for the SCP).
+    #[serde(default)]
+    pub bearer_token_header: crate::sbi::SbiBearerHeader,
+    /// Outbound SBI TLS trust anchors and optional client identity.
+    pub tls: Option<crate::sbi::SbiTlsConfig>,
     /// NRF discovery endpoint URL.
     pub nrf_url: Option<String>,
     /// Default timeout for SBI requests in seconds.
@@ -359,6 +367,8 @@ pub struct SbiYamlConfig {
     pub requester_nf_type: Option<String>,
     /// Listen address for incoming PCF event notifications (e.g. "0.0.0.0:8080").
     pub notif_listen: Option<String>,
+    /// Optional inbound TLS identity and client trust anchors.
+    pub notif_tls: Option<SbiNotifTlsConfig>,
     /// The callback base URI the PCF reaches this node at, for example
     /// `http://192.0.2.10:8080/sbi/events`. Sent as `notifUri` on every N5
     /// create that does not pass its own `notif_uri`. TS 29.514 requires the
@@ -374,10 +384,105 @@ fn default_sbi_timeout() -> u64 {
 impl SbiYamlConfig {
     pub fn to_sbi_config(&self) -> crate::sbi::SbiConfig {
         crate::sbi::SbiConfig {
+            tls: self.tls.clone(),
+            // Empty is unset, as for a path taken from the environment.
+            bearer_token_file: self
+                .bearer_token_file
+                .clone()
+                .filter(|path| !path.trim().is_empty()),
+            bearer_token_header: self.bearer_token_header,
+            npcf_url: self.npcf_url.clone(),
+            bsf_url: self.bsf_url.clone(),
+            nchf_url: self.nchf_url.clone(),
             nrf_url: self.nrf_url.clone(),
             timeout_secs: self.timeout_secs,
             oauth2_client_id: self.oauth2_client_id.clone(),
             oauth2_client_secret: self.oauth2_client_secret.clone(),
+        }
+    }
+}
+
+#[cfg(test)]
+mod empty_bearer_tests {
+    #[test]
+    fn an_empty_bearer_token_file_is_unset() {
+        for value in ["\"\"", "\"  \""] {
+            let yaml = format!("bearer_token_file: {value}\n");
+            let config: super::SbiYamlConfig =
+                serde_saphyr::from_str(&yaml).expect("sbi config parses");
+            assert_eq!(config.to_sbi_config().bearer_token_file, None, "{value}");
+        }
+        let config: super::SbiYamlConfig =
+            serde_saphyr::from_str("bearer_token_file: /run/secrets/token\n")
+                .expect("sbi config parses");
+        assert_eq!(
+            config.to_sbi_config().bearer_token_file.as_deref(),
+            Some("/run/secrets/token")
+        );
+    }
+
+    #[test]
+    fn the_bearer_header_is_authorization_unless_proxy_authorization_is_named() {
+        use crate::sbi::SbiBearerHeader;
+        let header = |yaml: &str| {
+            serde_saphyr::from_str::<super::SbiYamlConfig>(yaml)
+                .map(|config| config.to_sbi_config().bearer_token_header)
+        };
+        assert_eq!(
+            header("timeout_secs: 5\n").ok(),
+            Some(SbiBearerHeader::Authorization)
+        );
+        assert_eq!(
+            header("bearer_token_header: authorization\n").ok(),
+            Some(SbiBearerHeader::Authorization)
+        );
+        assert_eq!(
+            header("bearer_token_header: proxy-authorization\n").ok(),
+            Some(SbiBearerHeader::ProxyAuthorization)
+        );
+        assert!(header("bearer_token_header: cookie\n").is_err());
+    }
+}
+
+/// Inbound PCF notification TLS. Empty paths are treated as unset.
+#[derive(Debug, Deserialize, Clone)]
+#[serde(try_from = "NotifTlsFields")]
+pub struct SbiNotifTlsConfig {
+    pub cert: Option<String>,
+    pub key: Option<String>,
+    pub client_ca: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct NotifTlsFields {
+    cert: Option<String>,
+    key: Option<String>,
+    client_ca: Option<String>,
+}
+
+impl TryFrom<NotifTlsFields> for SbiNotifTlsConfig {
+    type Error = String;
+
+    fn try_from(fields: NotifTlsFields) -> Result<Self, Self::Error> {
+        let config = Self {
+            cert: fields.cert.filter(|path| !path.is_empty()),
+            key: fields.key.filter(|path| !path.is_empty()),
+            client_ca: fields.client_ca.filter(|path| !path.is_empty()),
+        };
+        config.identity()?;
+        Ok(config)
+    }
+}
+
+impl SbiNotifTlsConfig {
+    /// Validate also for callers constructing the Rust configuration directly.
+    pub(crate) fn identity(&self) -> Result<Option<(&str, &str)>, String> {
+        let cert = self.cert.as_deref().filter(|path| !path.is_empty());
+        let key = self.key.as_deref().filter(|path| !path.is_empty());
+        match (cert, key) {
+            (None, None) => Ok(None),
+            (Some(cert), Some(key)) => Ok(Some((cert, key))),
+            _ => Err("sbi.notif_tls.cert and sbi.notif_tls.key must be supplied together".into()),
         }
     }
 }

@@ -854,8 +854,8 @@ log:
     assert_eq!(config.registrar.backend, RegistrarBackendType::Redis);
     assert_eq!(config.registrar.default_expires, 1800);
     assert_eq!(
-        config.registrar.redis.as_ref().unwrap().url,
-        "redis://127.0.0.1:6379"
+        config.registrar.redis.as_ref().unwrap().target,
+        crate::redis_target::RedisTarget::Url("redis://127.0.0.1:6379".into())
     );
     assert_eq!(config.auth.users.get("alice").unwrap(), "secret");
     assert_eq!(config.log.level, LogLevel::Debug);
@@ -4325,6 +4325,77 @@ fn absent_isc_and_sbi() {
 // -----------------------------------------------------------------------
 // Environment variable expansion
 // -----------------------------------------------------------------------
+
+#[test]
+fn expand_env_var_default_may_name_another_variable() {
+    std::env::remove_var("SIPHON_TEST_NESTED_OUTER");
+    std::env::set_var("SIPHON_TEST_NESTED_INNER", "192.0.2.7");
+    assert_eq!(
+        expand_env_vars(
+            "url: ${SIPHON_TEST_NESTED_OUTER:-redis://${SIPHON_TEST_NESTED_INNER:-cache}:6379}"
+        ),
+        "url: redis://192.0.2.7:6379"
+    );
+    std::env::remove_var("SIPHON_TEST_NESTED_INNER");
+    assert_eq!(
+        expand_env_vars(
+            "url: ${SIPHON_TEST_NESTED_OUTER:-redis://${SIPHON_TEST_NESTED_INNER:-cache}:6379}"
+        ),
+        "url: redis://cache:6379"
+    );
+    std::env::set_var(
+        "SIPHON_TEST_NESTED_OUTER",
+        "redis+sentinel://192.0.2.9/primary",
+    );
+    assert_eq!(
+        expand_env_vars(
+            "url: ${SIPHON_TEST_NESTED_OUTER:-redis://${SIPHON_TEST_NESTED_INNER:-cache}:6379}"
+        ),
+        "url: redis+sentinel://192.0.2.9/primary"
+    );
+    std::env::remove_var("SIPHON_TEST_NESTED_OUTER");
+}
+
+#[test]
+fn expand_env_var_defaults_nest_more_than_once() {
+    for name in [
+        "SIPHON_TEST_DEPTH_A",
+        "SIPHON_TEST_DEPTH_B",
+        "SIPHON_TEST_DEPTH_C",
+    ] {
+        std::env::remove_var(name);
+    }
+    assert_eq!(
+        expand_env_vars(
+            "${SIPHON_TEST_DEPTH_A:-${SIPHON_TEST_DEPTH_B:-${SIPHON_TEST_DEPTH_C:-last}}}:5060"
+        ),
+        "last:5060"
+    );
+}
+
+#[test]
+fn expand_env_var_value_is_not_expanded_again() {
+    std::env::set_var("SIPHON_TEST_LITERAL", "${SIPHON_TEST_NOT_THERE:-x}");
+    assert_eq!(
+        expand_env_vars("${SIPHON_TEST_LITERAL}"),
+        "${SIPHON_TEST_NOT_THERE:-x}"
+    );
+    std::env::remove_var("SIPHON_TEST_LITERAL");
+}
+
+#[test]
+fn expand_env_var_text_that_is_no_reference_is_kept() {
+    for text in [
+        "cost: $5",
+        "${",
+        "${1BAD}",
+        "${NAME",
+        "a}b",
+        "${SIPHON_TEST_UNCLOSED:-x",
+    ] {
+        assert_eq!(expand_env_vars(text), text, "{text}");
+    }
+}
 
 #[test]
 fn expand_env_var_set() {

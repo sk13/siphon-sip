@@ -57,8 +57,19 @@ impl PeerPool {
     pub fn live_count(&self) -> usize {
         self.peers
             .iter()
-            .filter(|name| self.manager.live_backend(&self.tenant, name).is_some())
-            .count()
+            .map(|name| self.manager.open_members(Some(&self.tenant), name).len())
+            .sum()
+    }
+
+    /// Every open connection of the pool but `picked`, in configured order:
+    /// where a request goes when `picked` could not serve it.
+    pub fn alternates_to(&self, picked: &Arc<DiameterClient>) -> Vec<Arc<DiameterClient>> {
+        self.peers
+            .iter()
+            .flat_map(|name| self.manager.open_members(Some(&self.tenant), name))
+            .map(|(_, client)| client)
+            .filter(|client| !Arc::ptr_eq(client.peer(), picked.peer()))
+            .collect()
     }
 
     /// Pick the next live peer in round-robin order, skipping dead ones.
@@ -76,8 +87,8 @@ impl PeerPool {
         for offset in 0..count {
             let idx = (start.wrapping_add(offset)) % count;
             let name = &self.peers[idx];
-            if let Some(client) = self.manager.live_backend(&self.tenant, name) {
-                return Some((name.clone(), client));
+            if let Some(picked) = self.manager.live_named(Some(&self.tenant), name) {
+                return Some(picked);
             }
         }
         None
@@ -97,7 +108,12 @@ impl PeerPool {
         let live: Vec<(&String, u32)> = self
             .peers
             .iter()
-            .filter(|name| self.manager.live_backend(&self.tenant, name).is_some())
+            .filter(|name| {
+                !self
+                    .manager
+                    .open_members(Some(&self.tenant), name)
+                    .is_empty()
+            })
             .map(|name| (name, weights.get(name).copied().unwrap_or(1).max(1)))
             .collect();
         if live.is_empty() {
@@ -109,10 +125,7 @@ impl PeerPool {
         for (name, weight) in live {
             accumulated += weight;
             if tick < accumulated {
-                return self
-                    .manager
-                    .live_backend(&self.tenant, name)
-                    .map(|client| (name.clone(), client));
+                return self.manager.live_named(Some(&self.tenant), name);
             }
         }
         None
@@ -173,6 +186,8 @@ mod tests {
             application_ids: vec![],
             watchdog_interval: 30,
             reconnect_delay: 5,
+            source_address: None,
+            lifecycle: Default::default(),
             product_name: "SIPhon".to_string(),
             firmware_revision: 1,
         }

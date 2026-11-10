@@ -291,6 +291,7 @@ impl ServerHandshake {
         }
 
         let admitted = peer::spawn_connection_tasks(conn_config, stream, incoming_tx);
+        admitted.set_remote_identity(&asserted, peer::identity_avp(&cer.avps, "Origin-Realm"));
         info!(
             tenant = %acl_match.tenant,
             peer = %acl_match.peer,
@@ -346,6 +347,8 @@ impl ServerHandshake {
             application_ids,
             watchdog_interval: self.identity.watchdog_interval,
             reconnect_delay: 5,
+            source_address: None,
+            lifecycle: Default::default(),
             product_name: self.identity.product_name.clone(),
             firmware_revision: self.identity.firmware_revision,
         }
@@ -399,6 +402,8 @@ mod tests {
             application_ids,
             watchdog_interval: 30,
             reconnect_delay: 5,
+            source_address: None,
+            lifecycle: Default::default(),
             product_name: "client".into(),
             firmware_revision: 1,
         };

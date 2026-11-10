@@ -5079,7 +5079,9 @@ class MockCache:
                 so the value is accepted and ignored.
 
         Returns:
-            ``True`` if stored, ``False`` if cache name unknown.
+            ``True`` if stored, ``False`` if the cache name is unknown or the
+            Redis write failed (the local LRU, when configured, still holds
+            the value). The mock never fails a write.
         """
         if name not in self._stores:
             return False
@@ -5091,7 +5093,13 @@ class MockCache:
         return name in self._stores
 
     async def delete(self, name: str, key: str) -> bool:
-        """Delete a key. Returns ``True`` if the cache exists."""
+        """Delete a key.
+
+        Returns:
+            ``True`` if the delete reached the backend (the key may or may not
+            have existed), ``False`` if the cache name is unknown or the Redis
+            delete failed. The mock never fails a delete.
+        """
         if name not in self._stores:
             return False
         self._stores[name].pop(key, None)
@@ -10105,13 +10113,19 @@ class MockEventSink:
 
 
 class MockPeer:
-    """A backend peer handle returned by :class:`MockPeerPool` picks."""
+    """A peer handle: a :class:`MockPeerPool` pick, a
+    :meth:`MockDiameter.peer_for_host` result, or ``request.peer``.
 
-    def __init__(self, name: str, tenant: str, connected: bool = True) -> None:
+    ``host`` is the Origin-Host the peer gave in its CER or CEA, which
+    ``forward_to`` records in Route-Record; empty when not known.
+    """
+
+    def __init__(self, name: str, tenant: str, connected: bool = True, host: str = "") -> None:
         self.name = name
         self.tenant = tenant
         self.addr = f"{name}.example.org:3868"
         self.transport = "tcp"
+        self.host = host
         self._connected = connected
 
     def __bool__(self) -> bool:
@@ -10119,7 +10133,13 @@ class MockPeer:
 
 
 class MockPeerPool:
-    """Mock backend pool. Picks return a :class:`MockPeer` for the first
+    """DNS groups in production expand to OPEN members named ``name@address``.
+
+    Picks expose the member name; sticky picks bind to that member until it
+    becomes unavailable or the affinity expires. Configure mock member names
+    explicitly when testing this behavior; the mock does not resolve DNS.
+
+    Mock backend pool. Picks return a :class:`MockPeer` for the first
     connected member; round-robin advances a cursor."""
 
     def __init__(self, diameter: "MockDiameter", tenant: str, names: list) -> None:
@@ -10674,6 +10694,10 @@ class MockDiameter:
 
     def __init__(self) -> None:
         self._peers: dict[str, bool] = {}  # peer_name -> connected
+        # (tenant, lower-case Origin-Host) -> configured peer name
+        self._peer_hosts: dict[tuple[str, str], str] = {}
+        self.overload_reduction: int = 0
+        self.overload_validity: Optional[float] = None
         self._uar_responses: dict[str, dict] = {}  # public_identity -> response
         self._mar_responses: dict[str, dict] = {}
         self._zh_mar_responses: dict[str, dict] = {}
@@ -11288,6 +11312,21 @@ class MockDiameter:
             name: Peer name.
             connected: Whether the peer should appear as connected.
         """
+        self._peers[name] = connected
+
+    def add_peer_host(self, host: str, name: str, tenant: str = "default",
+                      connected: bool = True) -> None:
+        """Register a directly connected peer by the Origin-Host it gave in
+        its CER or CEA, for :meth:`peer_for_host` (test helper).
+
+        Args:
+            host: The peer's Origin-Host.
+            name: The configured peer it belongs to (``servers``,
+                ``connect_to`` or ``clients``).
+            tenant: Its tenant (``"default"`` for a single-domain server).
+            connected: Whether its connection is open.
+        """
+        self._peer_hosts[(tenant, host.lower())] = name
         self._peers[name] = connected
 
     def set_default_server_name(self, server_name: str) -> None:
@@ -12123,6 +12162,44 @@ class MockDiameter:
         names = [target] if isinstance(target, str) else list(target)
         return MockPeerPool(self, tenant, names)
 
+    def peer_for_host(self, host: str, tenant: Optional[str] = None) -> Optional[MockPeer]:
+        """The directly connected peer whose Origin-Host is ``host``, for
+        ``req.forward_to``, or ``None`` when no open connection has it.
+
+        Covers every connection of a Diameter server, whichever side opened
+        it (``servers``, ``connect_to``, ``clients``). A peer is known by the
+        Origin-Host of its CER or CEA, compared without regard to case. A
+        relay sends a request whose Destination-Host is a directly connected
+        peer to that peer (RFC 6733 section 6.1.6)::
+
+            peer = diameter.peer_for_host(req.dest_host, tenant=req.peer.tenant)
+            if peer is not None:
+                return await req.forward_to(peer)
+
+        ``tenant`` defaults to ``"default"``. Register peers in tests with
+        :meth:`add_peer_host`.
+        """
+        scope = tenant or "default"
+        name = self._peer_hosts.get((scope, (host or "").lower()))
+        if name is None or not self._peers.get(name, False):
+            return None
+        return MockPeer(name, scope, host=host)
+
+    def set_overload(self, reduction_percentage: int,
+                     validity_secs: Optional[float] = None) -> bool:
+        """Report overload (RFC 7683): ask the nodes that send this one
+        requests to abate ``reduction_percentage`` percent (0 to 100) of
+        them, for ``validity_secs`` seconds or until set again. ``0`` ends
+        the overload. Returns ``False`` when ``diameter.overload.reporting``
+        is not configured; the mock reports it as configured, and records
+        the last value in :attr:`overload_reduction` for a test to assert.
+        """
+        if not 0 <= reduction_percentage <= 100:
+            raise ValueError("reduction_percentage is 0 to 100")
+        self.overload_reduction = reduction_percentage
+        self.overload_validity = validity_secs
+        return True
+
     @staticmethod
     def ip_in_cidr(addr: str, cidr: str) -> bool:
         """Whether ``addr`` falls within ``cidr`` (mirrors the Rust helper)."""
@@ -12829,6 +12906,35 @@ class MockPresence:
         version = subscription.get("next_version", 0)
         subscription["next_version"] = min(version + 1, 0xFFFFFFFF)
         return version
+
+    def claim_notification(self, subscription_id: str, change_id: str) -> bool:
+        """Claim the right to send one notification on a subscription.
+
+        With several notifier nodes behind one name, a change can reach more
+        than one of them (a Cx push, a registration event each node observes).
+        Each calls this with the same ``change_id`` for each subscription it is
+        about to NOTIFY; exactly one gets ``True`` and sends, the others skip.
+        The claim is an atomic set-if-absent in the shared Redis, kept ten
+        minutes. Use an id that names the change and is the same on every node
+        (a registration's Call-ID and CSeq, a Cx transaction id), not one each
+        node makes up.
+
+        Always ``True`` without a shared store (no Redis registrar backend, or
+        ``registrar.redis.read_through_ttl_ms: 0``), and ``True`` when the store
+        cannot be reached (a NOTIFY sent twice is the lesser harm; logged).
+        With a shared store this is one blocking Redis round trip: the
+        interpreter is released for it, but an ``async def`` handler's event
+        loop waits.
+
+        Args:
+            subscription_id: The subscription ID.
+            change_id: Names the change being notified, the same on every node.
+
+        Returns:
+            ``True`` if this node won the claim and should send the NOTIFY. The
+            mock is one node with no shared store, so always ``True``.
+        """
+        return True
 
     def subscribers(self, resource: str) -> list[dict]:
         """List subscribers (watchers) for a resource.

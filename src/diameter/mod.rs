@@ -11,20 +11,27 @@
 //! exchange and DWR/DWA watchdog keepalives.
 
 pub mod auth;
+pub mod backoff;
+pub(crate) mod client_connection;
 pub mod codec;
 pub mod cx;
 #[cfg(test)]
 pub(crate) mod cx_test_support;
 pub mod dictionary;
+pub(crate) mod directory;
 pub mod event_sink;
 pub mod forward;
 pub mod gba;
 #[cfg(test)]
 pub(crate) mod gba_test_vectors;
+pub mod group;
+pub mod lifecycle;
 pub(crate) mod originate;
+pub mod overload;
 pub mod peer;
 pub mod pool;
 pub(crate) mod reauthorize;
+pub mod retry;
 pub mod rf;
 pub mod rf_service;
 pub mod ro;
@@ -41,6 +48,7 @@ pub mod sgd;
 pub mod sh;
 pub mod transport;
 pub mod unknown_avp;
+pub mod watchdog;
 
 use std::sync::Arc;
 
@@ -416,6 +424,7 @@ struct ResolvedRoute {
 }
 
 pub struct DiameterManager {
+    groups: DashMap<(Option<String>, String), group::Group>,
     /// Client-mode peers (`diameter.peers`), keyed by peer name. Used by
     /// `send_request` / `send_air` / etc. — never tenant-scoped.
     clients: DashMap<String, Arc<DiameterClient>>,
@@ -441,6 +450,7 @@ impl Default for DiameterManager {
 impl DiameterManager {
     pub fn new() -> Self {
         Self {
+            groups: DashMap::new(),
             clients: DashMap::new(),
             routes: Vec::new(),
             backends: DashMap::new(),
@@ -450,6 +460,7 @@ impl DiameterManager {
     /// Build a manager that routes by application, per `diameter.routes[]`.
     pub fn with_routes(routes: &[crate::config::DiameterRouteEntry]) -> Self {
         Self {
+            groups: DashMap::new(),
             clients: DashMap::new(),
             routes: routes
                 .iter()
@@ -555,7 +566,11 @@ impl DiameterManager {
             Some(route) => route
                 .peers
                 .iter()
-                .filter_map(|name| self.live_client(name))
+                .flat_map(|name| {
+                    self.open_members(None, name)
+                        .into_iter()
+                        .map(|(_, client)| client)
+                })
                 .collect(),
             None if self.routes.is_empty() => {
                 let mut names: Vec<String> = self
@@ -580,6 +595,9 @@ impl DiameterManager {
 
     /// Get a client by peer name.
     pub fn client(&self, name: &str) -> Option<Arc<DiameterClient>> {
+        if self.groups.contains_key(&(None, name.to_owned())) {
+            return self.live_client(name);
+        }
         self.clients
             .get(name)
             .map(|entry| Arc::clone(entry.value()))
@@ -592,14 +610,7 @@ impl DiameterManager {
     /// peer, and a disconnect flips the existing peer's state to `Closed`, so
     /// no separate deregister step is needed for routing correctness.
     pub fn live_client(&self, name: &str) -> Option<Arc<DiameterClient>> {
-        self.clients.get(name).and_then(|entry| {
-            let client = entry.value();
-            if client.peer().is_open() {
-                Some(Arc::clone(client))
-            } else {
-                None
-            }
-        })
+        self.live_named(None, name).map(|(_, client)| client)
     }
 
     /// Remove a peer entirely. Only used on config removal — disconnects rely
@@ -621,16 +632,8 @@ impl DiameterManager {
     /// to resolve a relay target — tenant-scoped so one tenant's backend can
     /// never resolve another tenant's same-named entry.
     pub fn live_backend(&self, tenant: &str, name: &str) -> Option<Arc<DiameterClient>> {
-        self.backends
-            .get(&(tenant.to_string(), name.to_string()))
-            .and_then(|entry| {
-                let client = entry.value();
-                if client.peer().is_open() {
-                    Some(Arc::clone(client))
-                } else {
-                    None
-                }
-            })
+        self.live_named(Some(tenant), name)
+            .map(|(_, client)| client)
     }
 
     /// Get the first available client (for single-peer setups).
@@ -646,12 +649,52 @@ impl DiameterManager {
         self.clients.len()
     }
 
+    /// Every open peer of `diameter.peers` but `picked`, by name: where a
+    /// request goes when `picked` could not serve it.
+    pub fn alternates_to(&self, picked: &Arc<DiameterClient>) -> Vec<Arc<DiameterClient>> {
+        let mut names: Vec<String> = self
+            .clients
+            .iter()
+            .map(|entry| entry.key().clone())
+            .collect();
+        names.sort();
+        names
+            .iter()
+            .filter_map(|name| self.live_client(name))
+            .filter(|client| !Arc::ptr_eq(client.peer(), picked.peer()))
+            .collect()
+    }
+
     /// Shutdown all peers.
     pub fn shutdown_all(&self) {
         for entry in self.clients.iter() {
             entry.value().shutdown();
         }
     }
+}
+
+/// Process-wide `DiameterManager`, set once at server bootstrap so Rust addon
+/// code can reach the manager the Python `diameter` namespace uses. Mirrors
+/// [`crate::ipsec::global_manager`].
+static GLOBAL_MANAGER: std::sync::OnceLock<Arc<DiameterManager>> = std::sync::OnceLock::new();
+
+/// Register the process-wide `DiameterManager`. Idempotent: the first caller
+/// wins and later calls are ignored. Called once, where the manager is built
+/// during server startup, before any registered extension task runs.
+pub fn set_global_manager(manager: Arc<DiameterManager>) {
+    let _ = GLOBAL_MANAGER.set(manager);
+}
+
+/// The running `DiameterManager`, for Rust addon code (a
+/// [`register_task`](crate::SiphonServer::register_task) closure, or a task it
+/// spawns). `None` when no `diameter:` block is configured.
+///
+/// Pick the peer with [`DiameterManager::route_client`] so the configured
+/// `diameter.routes[]` decide, then send with the typed `DiameterClient`
+/// methods (`send_mar`, `send_zh_mar`, ...). The calls are async and Rust-only;
+/// they never touch the Python interpreter.
+pub fn global_manager() -> Option<Arc<DiameterManager>> {
+    GLOBAL_MANAGER.get().cloned()
 }
 
 #[cfg(test)]
@@ -671,6 +714,8 @@ mod tests {
             application_ids: vec![],
             watchdog_interval: 30,
             reconnect_delay: 5,
+            source_address: None,
+            lifecycle: Default::default(),
             product_name: "SIPhon".to_string(),
             firmware_revision: 100,
         }
@@ -883,6 +928,8 @@ mod tests {
             application_ids: vec![],
             watchdog_interval: 30,
             reconnect_delay: 5,
+            source_address: None,
+            lifecycle: Default::default(),
             product_name: "SIPhon".to_string(),
             firmware_revision: 100,
         };
@@ -929,6 +976,8 @@ mod tests {
                 application_ids: vec![],
                 watchdog_interval: 30,
                 reconnect_delay: 5,
+                source_address: None,
+                lifecycle: Default::default(),
                 product_name: "SIPhon".to_string(),
                 firmware_revision: 100,
             };
@@ -1016,3 +1065,6 @@ mod tests {
         assert_eq!(&raw_bytes[16..], &[0xCDu8; 14]);
     }
 }
+
+#[cfg(test)]
+mod group_tests;
