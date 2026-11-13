@@ -692,6 +692,19 @@ pub(crate) async fn dispatch_request(
     let command_code = incoming.command_code;
     let request_features = crate::diameter::overload::request_features(&incoming.raw);
 
+    // Above the admission limit the answer is 3004 and the OC-OLR, made here:
+    // the request never reaches the Python executor.
+    if crate::diameter::overload::over_admission_limit() {
+        shed_too_busy(
+            &inbound_peer,
+            &incoming,
+            (&local_origin_host, &local_origin_realm),
+            start,
+        )
+        .await;
+        return;
+    }
+
     // Build the answer (and keep the Py request/answer for the completed hook)
     // on the Python executor. An `async def` handler that awaits — at any of
     // the three stages — ends that job instead of holding its worker: its
@@ -959,6 +972,31 @@ fn emitted_answer_result_label(wire: &[u8]) -> &'static str {
     };
     let (base, experimental) = answer.answer_result_codes();
     dictionary::answer_result_label(base, experimental)
+}
+
+/// Answer `incoming` DIAMETER_TOO_BUSY (3004) without running the script, as
+/// `diameter.overload.reporting.admission_limit` asks, with the overload this
+/// node reports (RFC 7683) for a requester that advertised DOIC.
+async fn shed_too_busy(
+    inbound_peer: &DiameterPeer,
+    incoming: &IncomingRequest,
+    local_origin: (&str, &str),
+    start: Instant,
+) {
+    let Some(wire) =
+        crate::diameter::overload::too_busy_answer(&incoming.raw, local_origin, "admission_limit")
+    else {
+        warn!("Diameter server: shed a request that does not parse, no answer sent");
+        return;
+    };
+    if let Err(error) = inbound_peer.send_response(wire).await {
+        warn!(%error, "Diameter server: failed to send the 3004 of the admission limit");
+    }
+    crate::metrics::record_diameter_inbound(
+        incoming.command_code,
+        dictionary::answer_result_label(Some(dictionary::DIAMETER_TOO_BUSY), None),
+        start.elapsed(),
+    );
 }
 
 /// The answer bytes plus optional Py handles for the completed hook.
@@ -2695,6 +2733,187 @@ mod awaiting_handler_tests {
 }
 
 #[cfg(test)]
+mod admission_limit_tests {
+    use super::*;
+    use crate::diameter::codec::{FLAG_PROXIABLE, FLAG_REQUEST};
+    use crate::diameter::overload::{self, Overload};
+    use std::time::Duration;
+
+    const SCRIPT: &str = concat!(
+        "import _siphon_registry\n",
+        "\n",
+        "calls = []\n",
+        "\n",
+        "def handle(request):\n",
+        "    calls.append(1)\n",
+        "    return request.answer(2001)\n",
+        "\n",
+        "_siphon_registry.register('diameter.on_request', None, handle, False)\n",
+    );
+
+    fn calls(engine: &ScriptEngine) -> usize {
+        Python::attach(|python| {
+            let state = engine.state();
+            let handlers = state.handlers_for(&HandlerKind::DiameterOnRequest(None));
+            let handler = handlers.first().expect("the handler is registered");
+            handler
+                .callable
+                .bind(python)
+                .getattr("__globals__")
+                .and_then(|globals| globals.get_item("calls"))
+                .and_then(|calls| calls.len())
+                .expect("the script keeps a call list")
+        })
+    }
+
+    fn peer_config() -> PeerConfig {
+        PeerConfig {
+            host: "192.0.2.10".to_string(),
+            port: 3868,
+            origin_host: "siphon.example.net".to_string(),
+            origin_realm: "example.net".to_string(),
+            destination_host: None,
+            destination_realm: "example.net".to_string(),
+            local_ip: "192.0.2.1".parse().expect("a literal address"),
+            application_ids: vec![],
+            watchdog_interval: 30,
+            reconnect_delay: 5,
+            source_address: None,
+            lifecycle: Default::default(),
+            product_name: "SIPhon".to_string(),
+            firmware_revision: 100,
+        }
+    }
+
+    fn incoming(advertise_doic: bool) -> IncomingRequest {
+        let mut avps = vec![
+            Avp::utf8(dictionary::avp::SESSION_ID, 0, "mme.example.net;1;1"),
+            Avp::utf8(dictionary::avp::ORIGIN_HOST, 0, "mme.example.net"),
+            Avp::utf8(dictionary::avp::ORIGIN_REALM, 0, "example.net"),
+        ];
+        if advertise_doic {
+            avps.push(overload::supported_features_avp(overload::FEATURE_LOSS));
+        }
+        let request = DiameterMsg {
+            flags: FLAG_REQUEST | FLAG_PROXIABLE,
+            command_code: 318,
+            application_id: dictionary::S6A_APP_ID,
+            hop_by_hop: 0x41,
+            end_to_end: 0x42,
+            avps,
+        };
+        IncomingRequest {
+            command_code: request.command_code,
+            application_id: request.application_id,
+            hop_by_hop: request.hop_by_hop,
+            end_to_end: request.end_to_end,
+            avps: serde_json::Value::Null,
+            raw: request.to_wire(),
+        }
+    }
+
+    async fn dispatch(engine: &Arc<ScriptEngine>, advertise_doic: bool) -> DiameterMsg {
+        let (write_tx, mut write_rx) = mpsc::channel(4);
+        let inbound_peer = Arc::new(DiameterPeer::new_for_test(peer_config(), write_tx));
+        tokio::spawn(dispatch_request(
+            Arc::clone(engine),
+            inbound_peer,
+            incoming(advertise_doic),
+            PyInboundPeer {
+                name: "mme".to_string(),
+                tenant: "default".to_string(),
+                addr: "192.0.2.10:3868".to_string(),
+                transport: "tcp".to_string(),
+                host: String::new(),
+            },
+            "siphon.example.net".to_string(),
+            "example.net".to_string(),
+        ));
+        let wire = tokio::time::timeout(Duration::from_secs(10), write_rx.recv())
+            .await
+            .expect("every request is answered")
+            .expect("the peer's write channel stays open");
+        DiameterMsg::from_wire(&wire).expect("the answer parses")
+    }
+
+    #[test]
+    fn a_shed_request_is_always_told_to_back_off_even_with_nothing_set() {
+        let _serial = crate::script::async_pool::pool_test_guard();
+        crate::script::async_pool::test_pools_runtime().block_on(async {
+            crate::script::async_pool::ensure_test_pools();
+            let engine =
+                Arc::new(ScriptEngine::new_embedded(SCRIPT).expect("the test script compiles"));
+            // No set_overload, no pending_requests: only the limit.
+            let config: crate::config::DiameterConfig =
+                serde_saphyr::from_str("overload:\n  reporting:\n    admission_limit: 0\n")
+                    .expect("the configuration parses");
+            overload::install(Overload::from_config(config.overload.as_ref()));
+            let answer = dispatch(&engine, true).await;
+            assert_eq!(answer.answer_result_codes().0, Some(3004));
+            let report = overload::parse_olr(&answer).expect("a 3004 comes with an OC-OLR");
+            assert!(report.reduction_percentage > 0);
+            assert_eq!(report.report_type, overload::ReportType::Host);
+            assert_eq!(calls(&engine), 0);
+            overload::install(Overload::new(false, None));
+        });
+    }
+
+    #[test]
+    fn above_the_admission_limit_the_answer_is_3004_with_the_report_and_no_script_runs() {
+        let _serial = crate::script::async_pool::pool_test_guard();
+        crate::script::async_pool::test_pools_runtime().block_on(async {
+            crate::script::async_pool::ensure_test_pools();
+            let engine =
+                Arc::new(ScriptEngine::new_embedded(SCRIPT).expect("the test script compiles"));
+            let config: crate::config::DiameterConfig = serde_saphyr::from_str(
+                "overload:\n  reporting:\n    validity: 30\n    admission_limit: 0\n",
+            )
+            .expect("the configuration parses");
+            overload::install(Overload::from_config(config.overload.as_ref()));
+            overload::current()
+                .reporting
+                .as_ref()
+                .expect("reporting is configured")
+                .set(60, None, Instant::now());
+
+            // A requester that advertised DOIC hears the overload.
+            let answer = dispatch(&engine, true).await;
+            assert_eq!(answer.answer_result_codes().0, Some(3004));
+            assert!(
+                answer.flags & crate::diameter::codec::FLAG_ERROR != 0,
+                "E bit"
+            );
+            assert_eq!(answer.hop_by_hop, 0x41);
+            assert_eq!(answer.end_to_end, 0x42);
+            let report = overload::parse_olr(&answer).expect("the OC-OLR is there");
+            assert!(
+                report.reduction_percentage >= 60,
+                "the larger of the set and the shed"
+            );
+            assert_eq!(report.report_type, overload::ReportType::Host);
+            assert!(overload::supports_loss(&answer));
+
+            // One that did not gets the plain 3004.
+            let plain = dispatch(&engine, false).await;
+            assert_eq!(plain.answer_result_codes().0, Some(3004));
+            assert!(overload::parse_olr(&plain).is_none());
+
+            assert_eq!(calls(&engine), 0, "the script was never called");
+
+            // Within the limit the script serves it.
+            let config: crate::config::DiameterConfig =
+                serde_saphyr::from_str("overload:\n  reporting:\n    admission_limit: 100\n")
+                    .expect("the configuration parses");
+            overload::install(Overload::from_config(config.overload.as_ref()));
+            let served = dispatch(&engine, true).await;
+            assert_eq!(served.answer_result_codes().0, Some(2001));
+            assert_eq!(calls(&engine), 1);
+            overload::install(Overload::new(false, None));
+        });
+    }
+}
+
+#[cfg(test)]
 mod backend_connection_tests {
     use super::*;
     use crate::config::{DiameterServerEntry, DiameterTenant, DiameterTenantIdentity};
@@ -2766,7 +2985,9 @@ mod backend_connection_tests {
         "    peer = diameter.peer_for_host(request.dest_host, tenant=request.peer.tenant)\n",
         "    if peer is None:\n",
         "        return request.reject(3002)\n",
-        "    return await request.forward_to(peer, timeout_secs=1.0)\n",
+        "    # One subscriber's request is a retransmission of the script's own.\n",
+        "    again = request.extract_imsi() == '001010000000003'\n",
+        "    return await request.forward_to(peer, timeout_secs=1.0, retransmitted=again)\n",
     );
 
     fn peer_config(origin_host: &str) -> PeerConfig {
@@ -2886,7 +3107,7 @@ mod backend_connection_tests {
             let (hss_peer, _hss_incoming) = hss.await.expect("the HSS accepts");
             let (mme_peer, mut mme_incoming) = mme.await.expect("the MME accepts");
             let mme_answering = Arc::clone(&mme_peer);
-            let (route_records_tx, mut route_records) = mpsc::channel::<Vec<String>>(4);
+            let (route_records_tx, mut route_records) = mpsc::channel::<(Vec<String>, u8, u32)>(4);
             tokio::spawn(async move {
                 while let Some(incoming) = mme_incoming.recv().await {
                     let request = DiameterMsg::from_wire(&incoming.raw).expect("the CLR parses");
@@ -2894,7 +3115,9 @@ mod backend_connection_tests {
                         .find_all(dictionary::avp::ROUTE_RECORD, 0)
                         .filter_map(|record| record.as_str())
                         .collect();
-                    let _ = route_records_tx.send(records).await;
+                    let _ = route_records_tx
+                        .send((records, request.flags, request.end_to_end))
+                        .await;
                     // One subscriber's requests are never answered.
                     if request.get_str(dictionary::avp::USER_NAME).as_deref()
                         == Some("001010000000002")
@@ -2930,9 +3153,12 @@ mod backend_connection_tests {
             );
             // RFC 6733 section 6.1.9: the identity of the peer the request
             // was received from, which is the HSS, not the relay itself.
+            let (records, flags, _) = route_records.recv().await.expect("the MME saw the request");
+            assert_eq!(records, vec!["hss-1.epc.example.net".to_string()]);
             assert_eq!(
-                route_records.recv().await.expect("the MME saw the request"),
-                vec!["hss-1.epc.example.net".to_string()]
+                flags & crate::diameter::codec::FLAG_RETRANSMITTED,
+                0,
+                "a request forwarded as it came has no T flag"
             );
 
             // The MME stays silent. The relay's 3004 must carry the HSS's own
@@ -2958,6 +3184,34 @@ mod backend_connection_tests {
                 .recv()
                 .await
                 .expect("the MME saw the second request");
+
+            // A script that retransmits sets T (RFC 6733 section 5.5.4); the
+            // End-to-End Identifier stays, the Hop-by-Hop is the relay's.
+            let mut again =
+                DiameterMsg::from_wire(&cancel_location(0x7000_0000 + hss_peer.next_hbh()))
+                    .expect("the CLR parses");
+            again
+                .avps
+                .retain(|avp| avp.code != dictionary::avp::USER_NAME);
+            again
+                .avps
+                .push(Avp::utf8(dictionary::avp::USER_NAME, 0, "001010000000003"));
+            let answer = hss_peer
+                .send_request_timeout(again.to_wire(), Duration::from_secs(5))
+                .await
+                .expect("the relay answers");
+            let answer = DiameterMsg::from_wire(&answer.raw).expect("the answer parses");
+            assert_eq!(answer.answer_result_codes().0, Some(2001));
+            let (_, flags, end_to_end) = route_records
+                .recv()
+                .await
+                .expect("the MME saw the retransmission");
+            assert_ne!(
+                flags & crate::diameter::codec::FLAG_RETRANSMITTED,
+                0,
+                "retransmitted=True sets the T flag"
+            );
+            assert_eq!(end_to_end, 0x5151, "End-to-End Identifier preserved");
 
             // A host no connection has: the relay's own 3002.
             let mut unknown =
